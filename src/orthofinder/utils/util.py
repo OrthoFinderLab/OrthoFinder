@@ -23,6 +23,8 @@
 #
 # For any enquiries send an email to David Emms
 # david_emms@hotmail.com
+import os
+import re
 import sys
 
 
@@ -33,6 +35,32 @@ csv_read_mode = "rb" if PY2 else "rt"
 
 
 from . import parallel_task_manager
+
+
+def substitute_variables(text, values):
+    """
+    text with each of the variables (keys of values, e.g. INPUT, OUTPUT) replaced
+    by its value, in one pass: a value is never searched for variables itself
+    (one after another, a path such as /data/PATHOGENS/... has its PATH replaced
+    too). The longer of two variables found at the same place is replaced, as
+    when the longer is replaced first.
+    """
+    if not values:
+        return text
+    pattern = re.compile("|".join(re.escape(k) for k in sorted(values, key=len, reverse=True)))
+    return pattern.sub(lambda m: values[m.group(0)], text)
+
+
+def file_variables(infilename, outfilename):
+    """The values of the file variables of a config.json command: INPUT, OUTPUT, BASENAME, PATH and BASEOUTNAME."""
+    path, basename = os.path.split(os.path.abspath(infilename))
+    return {
+        "INPUT": os.path.abspath(infilename),
+        "OUTPUT": os.path.abspath(outfilename),
+        "BASENAME": basename,
+        "PATH": path,
+        "BASEOUTNAME": os.path.basename(outfilename),
+    }
 
 
 """

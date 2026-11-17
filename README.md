@@ -321,7 +321,7 @@ Command-line options for OrthoFinder
   | Parameter        | Description                                                               |
   |------------------|---------------------------------------------------------------------------|
   | `-1`             | Only perform one-way sequence search.                                     |
-  | `-z`             | Don’t trim MSAs (columns >= 90% gap, min. alignment length 500).          |
+  | `-z`             | Don’t trim MSAs, the same as `--trim none`.                               |
   | `-y`             | Split paralogous clades below the root of a HOG into separate HOGs.        |
   | `-h`             | Print this help text.                                                     |
   | `-v`             | Print version.                                                     |

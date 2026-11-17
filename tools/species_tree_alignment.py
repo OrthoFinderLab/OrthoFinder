@@ -99,11 +99,10 @@ def main(args=None):
     except ValueError as e:
         parser.error(str(e))
 
-    # The orthogroups as the run has them (OrthoGroupsSet.get_ogs_all)
+    # The orthogroups as the run has them (OrthoGroupsSet.get_ogs_all): all of them, whatever the
+    # tree program, so that each one's index is its number (OG%07d), its alignment's file
     min_seq = int(settings.get("min_seq", 4))
     ogs = [[Seq(g) for g in og] for og in mcl.get_predicted_ogs(orthogroups_fn)]
-    if settings.get("tree_program") in ["raxml", "raxml-ng"]:
-        ogs = [og for og in ogs if len(og) >= min_seq]
     occupancy, iogs4 = concatenated_alignment.orthogroup_occupancy(ogs, min_seq)
     if occupancy.n_species < 4:
         print("ERROR: a species tree is only inferred for four or more species", file=sys.stderr)

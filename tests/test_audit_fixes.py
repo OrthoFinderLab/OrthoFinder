@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _process_hog_tree(t, rows, names):
     incoming, outgoing, reports = queue.Queue(), queue.Queue(), queue.Queue()
-    incoming.put(("OG0000000", t, {}))
+    incoming.put(("OG0000000", t, {}, {}, 0))
     incoming.put(None)
     update_trees.process_task(incoming, outgoing, {"OG0000000": rows}, {}, names, threading.Event(), reports)
     return outgoing.get_nowait()

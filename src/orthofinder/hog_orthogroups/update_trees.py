@@ -3,12 +3,12 @@ import io
 import numpy as np
 import multiprocessing as mp
 import queue
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import ete4
 import tempfile
 import traceback
 import time
-from ..utils import util, parallel_task_manager
+from ..utils import util, parallel_task_manager, system_info
 
 
 def write_tree(hog_name, newick_string, resolved_trees_id_dir):
@@ -148,11 +148,23 @@ def write_fasta(align_dir, hog_name, sequences, id_dict):
         raise
 
 
-def read_files(unique_og, spec_seq_id_dict, tree_file_index, fasta_file_index, exist_msa=True):
-   
+def read_files(unique_og, spec_seq_id_dict, tree_file_index, fasta_file_index, exist_msa=True,
+               fasta_dropped_index=None):
+    """
+    (unique_og, its gene tree, its alignment, the columns trimming removed
+    from it (--keep-dropped, {} if none))
+    """
     gene_tree = read_tree_file(unique_og, tree_file_index, spec_seq_id_dict)
     gene_dict = read_fasta_file(unique_og, fasta_file_index, exist_msa=exist_msa)
-    return (unique_og, gene_tree, gene_dict)
+    dropped_dict = {}
+    if fasta_dropped_index and unique_og in fasta_dropped_index:
+        dropped_dict = read_fasta(fasta_dropped_index[unique_og])
+    return (unique_og, gene_tree, gene_dict, dropped_dict)
+
+
+def has_residues(alignment, gaps="-"):
+    """Whether an alignment {gene: aligned sequence} has a residue, a character not in gaps (whitespace ignored)."""
+    return any("".join(seq.split()).strip(gaps) for seq in alignment.values())
 
 def check_path(s):
     s = s.strip().strip('"').strip("'")
@@ -220,6 +232,40 @@ def _put(q, item, stop_event, timeout=1.0):
     return False
 
 
+# The memory of the orthogroups being processed at once (read and not yet
+# written), estimated from their files (estimated_memory), besides the number of
+# orthogroups the queues hold: the largest orthogroups come first (OG0000000, ...),
+# and tens of them of tens of thousands of genes each would otherwise be in memory at once.
+MAX_MEMORY_IN_FLIGHT = 4 * 1024 ** 3
+# ... or this fraction of the memory the run can use, if more (system_info.memory_budget)
+MEMORY_IN_FLIGHT_FRACTION = 1 / 4
+
+# The memory of an orthogroup in flight per byte of its files (measured, ete4 and
+# read_fasta): a parsed tree takes ~27 times its newick, and is copied once more
+# while its HOGs are pruned; an alignment ~1.2 times its FASTA, read, then the
+# HOGs' pruned alignments and the pickles between the processes.
+TREE_MEMORY_FACTOR = 60
+ALIGNMENT_MEMORY_FACTOR = 3
+
+
+def _file_size(index, unique_og):
+    """The size of an orthogroup's file of the index (a tree index may hold the newick itself)."""
+    fn = index.get(unique_og) if index else None
+    if fn is None:
+        return 0
+    try:
+        return os.path.getsize(fn)
+    except (OSError, TypeError, ValueError):
+        return len(fn)
+
+
+def estimated_memory(unique_og, tree_file_index, fasta_file_index, fasta_dropped_index=None):
+    """The memory an orthogroup takes while it is processed, estimated from the size of its files."""
+    return int(TREE_MEMORY_FACTOR * _file_size(tree_file_index, unique_og)
+               + ALIGNMENT_MEMORY_FACTOR * (_file_size(fasta_file_index, unique_og)
+                                            + _file_size(fasta_dropped_index, unique_og)))
+
+
 def _report_error(report_queue, stop_event, where):
     stop_event.set()
     try:
@@ -236,8 +282,10 @@ def process_task(
         species_names, 
         stop_event,
         report_queue,
-        strict_prune_fail=False
+        strict_prune_fail=False,
+        dropped_gaps="-",
     ):
+    """dropped_gaps: the gaps and unknown characters of the trimming that wrote the dropped columns."""
     # (the rows hold only their non-empty cells, finalise.read_hog_file: a row's
     # genes are read from its own cells, not by a look-up of every species)
     species_set = set(species_names)
@@ -251,16 +299,17 @@ def process_task(
             if task is None:
                 break
 
-            unique_og, gene_tree, gene_dict = task
+            # (n_bytes, its estimated memory: given back to the ByteBudget by the writer, once written)
+            unique_og, gene_tree, gene_dict, dropped_dict, n_bytes = task
             hog_entries = hog_index.get(unique_og, [])
             results = []
 
             if gene_tree is None:
-                _put(process_queue, ("skip", unique_og, "no_gene_tree"), stop_event)
+                _put(process_queue, ("skip", unique_og, "no_gene_tree", n_bytes), stop_event)
                 continue
 
             if not hog_entries:
-                _put(process_queue, ("skip", unique_og, "no_hog_entries"), stop_event)
+                _put(process_queue, ("skip", unique_og, "no_hog_entries", n_bytes), stop_event)
                 continue
 
             hog_entries = sorted(hog_entries, key=lambda r: str(r.get("HOG", "")))
@@ -317,18 +366,25 @@ def process_task(
                 if gene_dict:
                     # without the columns that are gaps in all of the HOG's genes
                     pruned_alignments = trim_gap_columns({g: gene_dict[g] for g in valid_leaves if g in gene_dict})
+                pruned_dropped = None
+                if dropped_dict:
+                    # the same for the columns trimming removed (none left: not written)
+                    pruned_dropped = trim_gap_columns({g: dropped_dict[g] for g in valid_leaves if g in dropped_dict})
+                    if not has_residues(pruned_dropped, dropped_gaps):
+                        pruned_dropped = None
                 try:
                     newick = subtree.write(outfile=None, parser=5)
                 except Exception:
                     if strict_prune_fail:
                         raise
                     continue
-                results.append((hog_name, newick, pruned_alignments))
+                results.append((hog_name, newick, pruned_alignments, pruned_dropped))
 
+            del gene_tree, gene_dict, dropped_dict, task
             if not results:
-                msg = ("skip", unique_og, "no_outputs_from_hog_entries")
+                msg = ("skip", unique_og, "no_outputs_from_hog_entries", n_bytes)
             else:
-                msg = ("og", unique_og, results)
+                msg = ("og", unique_og, results, n_bytes)
             if not _put(process_queue, msg, stop_event):
                 break
           
@@ -349,8 +405,14 @@ def writer_task(
         align_dir, 
         stop_event, 
         report_queue,
-        exist_msa=True
+        exist_msa=True,
+        dropped_dir=None,
+        budget=None,
     ):
+    """
+    dropped_dir: where the columns trimming removed from each alignment are written (--keep-dropped).
+    budget: the ByteBudget the estimated memory of each orthogroup is given back to, once written.
+    """
     n_handled = 0
     try:
         while not stop_event.is_set():
@@ -365,16 +427,23 @@ def writer_task(
 
             kind = msg[0]
             if kind == "og":
-                _, unique_og, results = msg
-                for out_name, newick_string, pruned_alignments in results:
+                _, unique_og, results, n_bytes = msg
+                for out_name, newick_string, pruned_alignments, *dropped in results:
                     if not write_tree(out_name, newick_string, resolved_trees_id_dir):
                         raise RuntimeError("Failed to write tree %s" % out_name)
 
                     if exist_msa and pruned_alignments is not None and len(pruned_alignments) >= min_seq:
                         if align_dir is not None:
                             write_fasta(align_dir, out_name, pruned_alignments, id_dict)
-            elif kind != "skip":
+                        if dropped_dir is not None and dropped and dropped[0] is not None:
+                            write_fasta(dropped_dir, out_name, dropped[0], id_dict)
+            elif kind == "skip":
+                n_bytes = msg[3]
+            else:
                 raise TypeError("Unexpected message: %r" % (msg,))
+            del msg
+            if budget is not None:
+                budget.release(n_bytes)
             n_handled += 1
 
     except Exception:
@@ -382,17 +451,38 @@ def writer_task(
         raise
 
 
-def threaded_reader(read_queue, unique_ogs, spec_seq_id_dict, tree_file_index, fasta_file_index, n_threads, stop_event, report_queue, exist_msa=True):
+# The reads of threaded_reader submitted ahead, per thread
+READS_PER_THREAD = 2
+
+
+def threaded_reader(read_queue, unique_ogs, spec_seq_id_dict, tree_file_index, fasta_file_index, n_threads, stop_event, report_queue, exist_msa=True,
+                    fasta_dropped_index=None, budget=None):
+    """budget: a ByteBudget, the estimated memory of each orthogroup acquired before its files are read."""
     try:
         def worker(unique_og):
             if stop_event.is_set():
                 return
-            task = read_files(unique_og, spec_seq_id_dict, tree_file_index, fasta_file_index, exist_msa=exist_msa)
-            _put(read_queue, task, stop_event)
+            n_bytes = 0
+            if budget is not None:
+                n_bytes = estimated_memory(unique_og, tree_file_index, fasta_file_index, fasta_dropped_index)
+                if not budget.acquire(n_bytes, stop_event):
+                    return
+            task = read_files(unique_og, spec_seq_id_dict, tree_file_index, fasta_file_index, exist_msa=exist_msa,
+                              fasta_dropped_index=fasta_dropped_index)
+            _put(read_queue, task + (n_bytes,), stop_event)
         with ThreadPoolExecutor(max_workers=n_threads) as executor:
-            # Consume the results so an exception in any read is raised here.
-            for _ in executor.map(worker, unique_ogs):
-                pass
+            # At most READS_PER_THREAD reads waiting per thread (executor.map would submit
+            # every orthogroup at once). Their results are taken, so an exception in any
+            # read is raised here.
+            pending = set()
+            for unique_og in unique_ogs:
+                if len(pending) >= READS_PER_THREAD * n_threads:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        future.result()
+                pending.add(executor.submit(worker, unique_og))
+            for future in pending:
+                future.result()
     except Exception:
         _report_error(report_queue, stop_event, "reading trees/alignments")
         raise
@@ -427,7 +517,16 @@ def post_ogs_processing(
     align_dir=None,
     min_seq=4,
     exist_msa=True,
+    fasta_dropped_index=None,
+    dropped_dir=None,
+    dropped_gaps="-",
 ):
+    """
+    fasta_dropped_index, dropped_dir (--keep-dropped): the columns trimming
+    removed from each orthogroup's alignment, and where those of each MSA
+    written to align_dir are written, the same genes and name (if they have a
+    residue: a character not in dropped_gaps, the trimming's gaps and unknowns).
+    """
 
     if nprocess >= 128:
         n_reader_threads = min(max(nprocess // 4, 2), 32)
@@ -444,17 +543,18 @@ def post_ogs_processing(
     process_queue = mp.Queue(maxsize=max(4 * n_writer_processes, 16))
     report_queue = mp.Queue()
     stop_event = mp.Event()
+    budget = parallel_task_manager.ByteBudget(system_info.memory_budget(MAX_MEMORY_IN_FLIGHT, MEMORY_IN_FLIGHT_FRACTION))
 
     file_reader = mp.Process(
         target=threaded_reader,
         args=(read_queue, unique_ogs, spec_seq_id_dict, tree_file_index, fasta_file_index,
-              n_reader_threads, stop_event, report_queue, exist_msa)
+              n_reader_threads, stop_event, report_queue, exist_msa, fasta_dropped_index, budget)
     )
     file_processors = [
         mp.Process(
             target=process_task,
             args=(read_queue, process_queue, hog_index, name_dict, species_names,
-                  stop_event, report_queue)
+                  stop_event, report_queue, False, dropped_gaps)
         )
         for _ in range(n_processor_processes)
     ]
@@ -462,7 +562,7 @@ def post_ogs_processing(
         mp.Process(
             target=writer_task,
             args=(process_queue, min_seq, id_dict, resolved_trees_id_dir,
-                  align_dir, stop_event, report_queue, exist_msa)
+                  align_dir, stop_event, report_queue, exist_msa, dropped_dir, budget)
         )
         for _ in range(n_writer_processes)
     ]

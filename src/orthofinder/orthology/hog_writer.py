@@ -28,6 +28,16 @@ PY2 = sys.version_info <= (3,)
 
 debug = False   # HOGs
 
+# The dups_below of the nodes with no duplications below them (mark_dups_below)
+NO_DUPS = frozenset()
+
+
+class SparseRow(tuple):
+    """A HOG row (get_hog_file_entries): (OG, gene tree node, ((species column,
+    genes), ...)), its species with genes only (HogWriter.dense_row)."""
+    __slots__ = ()
+
+
 class HogWriter(object):
     def __init__(
             self, 
@@ -226,9 +236,12 @@ class HogWriter(object):
         if not n.is_root():
             hogs_to_write.difference_update(n.up.done)
 
+        # (a node with none to write shares its parent's set, never changed in
+        # place: a copy at every node is the HOG levels x the nodes of the tree)
         n.add_feature(
             "done",
-            hogs_to_write if n.is_root() else n.up.done.union(hogs_to_write)
+            hogs_to_write if n.is_root() else
+            n.up.done.union(hogs_to_write) if hogs_to_write else n.up.done
         )
 
         if len(hogs_to_write) == 0:
@@ -358,21 +371,26 @@ class HogWriter(object):
             q_ids = h == "N0" and (not self.write_output or "N0.ids" in self.hog_paths)
             if not (q_names or q_ids):
                 continue
-            genes_row_ids = ["" for _ in self.i_sps]
-            genes_row = ["" for _ in self.i_sps]
+            # The rows hold only their species with genes, (column, genes) in
+            # column order (a SparseRow, see dense_row): a row of every species
+            # column is ~10 KB at a thousand species, and a large tree has
+            # hundreds of thousands of rows (sent to and held by the HOG writer).
+            genes_row_ids = []
+            genes_row = []
             # put the units into the row
-            for isp in units:
+            for isp in sorted(units, key=self.i_sp_to_index.__getitem__):
                 # translate the species ID to the species column it should be in
                 # after accounting for removed species
-                genes_row_ids[self.i_sp_to_index[isp]] = genes_ids_per_species_id[isp]
+                i_col = self.i_sp_to_index[isp]
+                genes_row_ids.append((i_col, genes_ids_per_species_id[isp]))
                 if q_names:
-                    genes_row[self.i_sp_to_index[isp]] = ", ".join(sorted([self.seq_ids[g] for g in genes_ids_per_species_id[isp].split(", ")]))
+                    genes_row.append((i_col, ", ".join(sorted([self.seq_ids[g] for g in genes_ids_per_species_id[isp].split(", ")]))))
                 q_empty = False
             if not q_empty: 
                 if q_names:
-                    ret.append((h, [og_name, gt_node_name] + genes_row))
+                    ret.append((h, SparseRow((og_name, gt_node_name, tuple(genes_row)))))
                 if q_ids:
-                    ret.append(("N0.ids", [og_name, gt_node_name] + genes_row_ids))
+                    ret.append(("N0.ids", SparseRow((og_name, gt_node_name, tuple(genes_row_ids)))))
                 # self.writers[h].writerow(["%s.HOG%07d" % (h, self.get_hog_index(h)),  og_name, gt_node_name] + genes_row)
         return ret
 
@@ -445,19 +463,23 @@ class HogWriter(object):
                         n.add_feature("dup_level", l)
                         q_dup_evidenced = True
 
-            dups_below = set()
-
-            for ch in n.get_children():
-                if ch.is_leaf():
-                    continue
-                dups_below.update(getattr(ch, "dups_below", set()))
-
-            if (
-                    getattr(n, "dup", False)
-                    and q_dup_evidenced
-                    and getattr(n, "dup_level", "").startswith("N")
-                ):
-                dups_below.add(n.dup_level)
+            below = [
+                ch.dups_below for ch in n.get_children()
+                if not ch.is_leaf() and getattr(ch, "dups_below", None)
+            ]
+            q_add = (
+                getattr(n, "dup", False)
+                and q_dup_evidenced
+                and getattr(n, "dup_level", "").startswith("N")
+            )
+            if not q_add and len(below) <= 1:
+                # nothing new: the child's set, shared (never changed in place),
+                # not a copy at every node (the levels x the nodes of the tree)
+                dups_below = below[0] if below else NO_DUPS
+            else:
+                dups_below = set().union(*below)
+                if q_add:
+                    dups_below.add(n.dup_level)
 
             n.add_feature("dups_below", dups_below)
 
@@ -488,12 +510,17 @@ class HogWriter(object):
         - b. get all multi-copy species, get MRCA
         - Get lower of a & b
         """
-        # try each in turn and see if it is supported
+        # try each in turn and see if it is supported: a level of two of them,
+        # then each pair of the different levels (not each pair of children: a
+        # polytomy can have tens of thousands, the levels are species tree nodes)
         attested = set()
-        for l1, l2 in itertools.combinations(mrcas, 2):
-            if l1 == l2:
-                attested.add(l1)
-            elif self._is_below(l2, l1):
+        seen = set()
+        for l in mrcas:
+            if l in seen:
+                attested.add(l)
+            seen.add(l)
+        for l1, l2 in itertools.combinations(sorted(seen, key=str), 2):
+            if self._is_below(l2, l1):
                 attested.add(l2)
             elif self._is_below(l1, l2):
                 attested.add(l1)
@@ -518,6 +545,17 @@ class HogWriter(object):
         print(mrcas)
         # raise Exception()
         return None
+
+    def dense_row(self, row):
+        """A HOG row as written: OG, gene tree node and every species column (a
+        SparseRow expanded, a list as it is)."""
+        if type(row) is not SparseRow:
+            return row
+        og_name, gt_node_name, cells = row
+        dense = [og_name, gt_node_name] + [""] * len(self.i_sps)
+        for i_col, text in cells:
+            dense[2 + i_col] = text
+        return dense
 
     def write_cached_hogs(
             self,
@@ -559,7 +597,7 @@ class HogWriter(object):
                         if h == "N0":
                             n0_ids.append(hog_id)
                     if fh is not None:
-                        file_io.write_unquoted(fh, [hog_id] + r)
+                        file_io.write_unquoted(fh, [hog_id] + self.dense_row(r))
         finally:
             if lock_hogs is not None:
                 lock_hogs.release()

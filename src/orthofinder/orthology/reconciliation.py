@@ -23,12 +23,15 @@ import warnings
 import queue
 import time
 import io
+
+import numpy as np
 try:
     from rich import print
 except ImportError:
     ...
 
-from .tree_analyser import TreeAnalyser, mrca_node, gene_to_species_dash, get_lines_for_ortholog_files, empty_ortholog_lines
+from .tree_analyser import TreeAnalyser, mrca_node, gene_to_species_dash, get_lines_for_ortholog_files, empty_ortholog_lines, \
+    write_polytomies
 from .hog_writer import HogWriter
 from .parallel_pipeline import run_orthologs_parallel_pipeline, set_file_descriptor_limit
 from .ortholog_writers import ParentOutputWriter
@@ -327,13 +330,26 @@ def do_orthologs_for_ortho_finder(
             progressbar, task = printing.get_progressbar(total_tasks)
             progressbar.start()
 
-            n_orthologs_sp_pair = stats.NOrthoSp(nspecies)
+            # (the HOG pass counts none: write_hog_tree)
+            n_orthologs_sp_pair = None if write_hog_tree else stats.NOrthoSp(nspecies)
+            output_writer.runs.spill_dir = file_handler.handler.get_working_directory_write()
+
+            def emit_chunk(iog, olog_texts, sus_texts):
+                # a large tree's rows, as they are made: held on disk until write_result
+                output_writer.add_chunk(iog, {
+                    "olog_chunks": list(olog_texts.items()),
+                    "xenolog_chunks": list(sus_texts.items()),
+                })
 
             try:
                 for completed_tasks, iog in enumerate(iogs4, start=1):
                     # (the counts added to n_orthologs_sp_pair, as the parallel workers do:
                     # not a species x species NOrthoSp per tree)
-                    result = ta.analyse_tree(iog, n_ortho_acc=n_orthologs_sp_pair)
+                    result = ta.analyse_tree(
+                        iog,
+                        n_ortho_acc=n_orthologs_sp_pair,
+                        emit_chunk=emit_chunk if output_writer.need_ortholog_output else None,
+                    )
 
                     if result is None:
                         progressbar.update(task, advance=1)
@@ -377,6 +393,8 @@ def do_orthologs_for_ortho_finder(
                 spill_dir=file_handler.handler.get_working_directory_write(),
             )
 
+        if not write_hog_tree:
+            write_polytomies(ta.polytomies, file_handler.handler.get_user_resolved_tree_dir())
 
     except IOError as e:
         if str(e).startswith("[Errno 24] Too many open files"):
@@ -388,23 +406,63 @@ def do_orthologs_for_ortho_finder(
     return n_orthologs_sp_pair
 
 
+class SpeciesNeighbours(object):
+    """
+    The topological distance of each species from the others in the species
+    tree, neighbours[sp][other]: the number of nodes above sp below the one
+    that has other below it too (0 for its sister). An array of species x
+    species (int16, or int32 for a tree deeper than that), not a dictionary
+    of dictionaries: species^2 Python entries, several GB at 5,000 species.
+    """
+
+    def __init__(self, names, levels):
+        self.index = {name: i for i, name in enumerate(names)}
+        self.levels = levels
+
+    def __getitem__(self, sp):
+        return _NeighbourRow(self.levels[self.index[sp]], self.index)
+
+    def __len__(self):
+        return len(self.index)
+
+
+class _NeighbourRow(object):
+    __slots__ = ("row", "index")
+
+    def __init__(self, row, index):
+        self.row = row
+        self.index = index
+
+    def __getitem__(self, other):
+        return int(self.row[self.index[other]])
+
+
 def get_species_neighbours(t):
     """
     Args: t = rooted species tree
-    
+
     Returns:
-    dict: species -> species_dict, such that species_dict: other_species -> toplogical_dist 
+    SpeciesNeighbours: neighbours[species][other_species] -> topological distance
     """
     species = t.get_leaf_names()
-    levels = {s:[] for s in species}
-    for n in t.traverse('postorder'):
-        if n.is_leaf(): continue
-        children = n.get_children()
-        leaf_sets = [set(ch.get_leaf_names()) for ch in children]
-        not_i = [set.union(*[l for j, l in enumerate(leaf_sets) if j != i]) for i in range(len(children))]
-        for l,n in zip(leaf_sets, not_i):
-            for ll in l:
-                levels[ll].append(n)
-    neighbours = {sp:{other:n for n,others in enumerate(lev) for other in others} for sp, lev in levels.items()}
-    return neighbours
+    index = {s: i for i, s in enumerate(species)}
+    n = len(species)
+    # the distance of a species from another is the number of the nodes above it before their
+    # common ancestor (the level, in postorder): one pass down from each species to the root
+    levels = np.zeros((n, n), dtype=np.int16 if n < np.iinfo(np.int16).max else np.int32)
+    level = np.zeros(n, dtype=np.int64)
+    leaves = {}     # node -> the indices of its species, until its parent is reached
+    for node in t.traverse('postorder'):
+        if node.is_leaf():
+            leaves[node] = np.array([index[node.name]], dtype=np.int64)
+            continue
+        children = node.get_children()
+        sets = [leaves.pop(ch) for ch in children]
+        everyone = np.concatenate(sets)
+        for i, own in enumerate(sets):
+            others = np.concatenate([x for j, x in enumerate(sets) if j != i]) if len(sets) > 1 else everyone[:0]
+            levels[np.ix_(own, others)] = level[own][:, None]
+        level[everyone] += 1
+        leaves[node] = everyone
+    return SpeciesNeighbours(species, levels)
 

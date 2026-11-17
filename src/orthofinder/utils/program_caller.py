@@ -38,6 +38,7 @@ except ImportError:
     import Queue as queue
 
 from . import util, parallel_task_manager, programs
+from ..gene_tree import trim
 from .printing import printer
 try:
     from rich import print
@@ -157,6 +158,29 @@ MQITVKDLVHTFLAKTPYELNAIDNINVTIKQGEFVGVIGQTGSGKTTFIEHLNALLLPSAGSVEWVFEN
 MIKVTDLMFKYPSAQANAIEKLNLEIESGKYVAILGHNGSGKSTFSKLLVALYKPADGKIELDGTTISKE"""
 
 
+def test_alignment(n_seqs=12, n_cols=300, seed=7, nucleotide=False):
+    """
+    An alignment to test a trimming program on, the same every time: homologous
+    sequences (an ancestral sequence with 10% of its residues changed in each,
+    as programs that score conservation, e.g. BMGE, remove random sequences
+    entirely), with every seventh column mostly gaps (to be removed).
+    nucleotide: back-translated, a codon per residue (_TEST_CODONS) and a gap per base.
+    """
+    import random
+    rng = random.Random(seed)
+    aas = "ACDEFGHIKLMNPQRSTVWY"
+    ancestor = [rng.choice(aas) for _ in range(n_cols)]
+    lines = []
+    for i in range(n_seqs):
+        seq = "".join("-" if rng.random() < (0.9 if c % 7 == 0 else 0.03)
+                      else rng.choice(aas) if rng.random() < 0.1 else a
+                      for c, a in enumerate(ancestor))
+        if nucleotide:
+            seq = "".join(_TEST_CODONS.get(c, "---") for c in seq)
+        lines.append(">%d_%d\n%s\n" % (i % 4, i, seq))
+    return "".join(lines)
+
+
 class InvalidEntryException(Exception):
     pass
 
@@ -266,6 +290,7 @@ class ProgramCaller(object):
         self.msa = dict()
         self.tree = dict()
         self.species_tree = dict()  # species tree from gene trees (-ST)
+        self.trim = dict()  # MSA trimming programs (--trim): trim.TrimProgram
         self.search_db = dict()
         self.search_search = dict()
         # Optional, for a search program OrthoFinder cannot read the output
@@ -325,6 +350,15 @@ class ProgramCaller(object):
                             print(("Species tree inference method '%s' has already been defined, skipping config file entry." % name))
                         else:
                             self.species_tree[name] = Method(name, v)
+                    elif v["program_type"] == "trim":
+                        if name in self.trim:
+                            print(("Trimming program '%s' has already been defined, skipping config file entry." % name))
+                        else:
+                            try:
+                                self.trim[name] = trim.TrimProgram(name, v)
+                            except trim.InvalidTrimEntry as e:
+                                print(("WARNING: Incorrectly formatted configuration file entry: %s" % name))
+                                print(str(e))
                     elif v["program_type"] == "search":
                         if ("db_cmd" not in v) or ("search_cmd" not in v):
                             print(("WARNING: Incorrectly formatted configuration file entry: %s" % name))
@@ -344,7 +378,7 @@ class ProgramCaller(object):
                                 )
                     else:
                         print(("WARNING: Incorrectly formatted configuration file entry: %s" % name))
-                        print(("'program_type' should be 'msa', 'tree', 'species_tree' or 'search', got '%s'" % v["program_type"]))
+                        print(("'program_type' should be 'msa', 'tree', 'species_tree', 'trim' or 'search', got '%s'" % v["program_type"]))
                 except InvalidEntryException:
                     pass
 
@@ -352,6 +386,7 @@ class ProgramCaller(object):
         self.msa.update(other.msa)
         self.tree.update(other.tree)
         self.species_tree.update(other.species_tree)
+        self.trim.update(other.trim)
         self.search_db.update(other.search_db)
         self.search_search.update(
             other.search_search
@@ -366,6 +401,58 @@ class ProgramCaller(object):
 
     def list_species_tree_methods(self):
         return [key for key in self.species_tree]
+
+    def list_trim_methods(self):
+        return [key for key in self.trim]
+
+    def get_trim_program(self, name):
+        """The trimming program (trim.TrimProgram) configured as name."""
+        return self.trim[name]
+
+    def test_trim_method(self, method_name, d_test, keep_dropped=False, nucleotide=False):
+        """
+        Run a trimming program on a test alignment (test_alignment, of
+        nucleotides if nucleotide, the run's input -d): it works if it trims
+        it, with every sequence kept (trim.run_program), and if keep_dropped
+        writes the columns it removes. Returns (success, stdout, stderr, cmd)
+        as the other tests, or True if the test is turned off.
+        """
+        util.print_no_new_line(f'Test can run "[orange3]{method_name}[/orange3]"')
+        program = self.trim[method_name]
+        if program.skip_check:
+            printer.print(" - test has been manually over-ridden", style="warning")
+            return True
+        infn = os.path.join(d_test, "TrimTest.fa")
+        with open(infn, "w", encoding="utf-8", newline="\n") as outfile:
+            outfile.write(test_alignment(nucleotide=nucleotide))
+        outfn = os.path.join(d_test, "TrimTest.%s.fa" % method_name)
+        dropped_fn = outfn + ".dropped.fa" if keep_dropped else None
+        outputs = []
+
+        def run(cmd, env):
+            _, out, err = parallel_task_manager.run_monitored_command(
+                cmd, env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            outputs.append((cmd, out.decode(errors="replace"), err.decode(errors="replace")))
+            return _, out, err
+
+        note, warning, q_failed = trim.run_program(program, infn, outfn, 0, dropped_fn, env=parallel_task_manager.my_env,
+                                                   run=run, nucleotide=nucleotide)
+        if q_failed:
+            warning = note      # (it failed: the alignment was kept untrimmed)
+        if warning is None and keep_dropped and not os.path.exists(dropped_fn):
+            warning = "it did not write the columns it removed"
+        cmd = "\n".join(c for c, _, _ in outputs)
+        if warning is None:
+            printer.print(" - [bold green]ok")
+            return True, [o for _, o, _ in outputs], [e for _, _, e in outputs], cmd
+        printer.print(" - [bold red]failed")
+        print(warning)
+        for _, out, err in outputs:
+            for text in (out, err):
+                # (the reason already ends with the program's last line of stderr)
+                if text.strip() and text.strip() not in warning:
+                    print(text)
+        return False, [o for _, o, _ in outputs], [e for _, _, e in outputs], cmd
 
     def get_search_output_fields(self, method_name):
         """The columns declared with "output_fields" for a search method, or None."""
@@ -868,37 +955,21 @@ class ProgramCaller(object):
         method_threads=None,
     ):
 
-        path, basename = os.path.split(infilename)
-        path_out, basename_out = os.path.split(outfilename)
-        infilename = os.path.abspath(infilename)
-        outfilename = os.path.abspath(outfilename)
-        
-        path = os.path.abspath(path)# + os.path.sep
-
-        outstring = (
-            instring.replace("INPUT", infilename)
-            .replace("OUTPUT", outfilename)
-            .replace("BASENAME", basename)
-            .replace("PATH", path)
-            .replace("BASEOUTNAME", basename_out)
-        )
-
+        # (in one pass: a path is not searched for the variables, see
+        # util.substitute_variables)
+        values = util.file_variables(infilename, outfilename)
         if "diamond" in instring:
             if scorematrix and gapopen and gapextend:
-                outstring = (
-                    outstring.replace("SCOREMATRIX", scorematrix)
-                    .replace("GAPOPEN", gapopen)
-                    .replace("GAPEXTEND", gapextend)
-                )
+                values.update({"SCOREMATRIX": scorematrix, "GAPOPEN": gapopen, "GAPEXTEND": gapextend})
 
         if identifier is not None:
-            outstring = outstring.replace("IDENTIFIER", identifier)
+            values["IDENTIFIER"] = identifier
         if dbname is not None:
-            outstring = outstring.replace("DATABASE", dbname)
+            values["DATABASE"] = dbname
         if method_threads is not None and "METHODTHREAD" in instring:
-            outstring = outstring.replace("METHODTHREAD", method_threads)
+            values["METHODTHREAD"] = method_threads
 
-        return outstring
+        return util.substitute_variables(instring, values)
 
     def _get_method_type_name(self, method_type):
         if method_type == "msa":

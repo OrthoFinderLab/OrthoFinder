@@ -31,6 +31,20 @@ orthogroup_gene_count
 split_ortholog_files
     Convert compact ortholog results into pairwise species files.
 
+trim_msa
+    Trim a multiple sequence alignment as a run does, with OrthoFinder's own
+    trimming or a trimming program of config.json, optionally saving the
+    columns removed.
+
+species_overlaps
+    Write the number of orthogroups shared by each pair of species
+    (Orthogroups_SpeciesOverlaps.tsv), from the results of a finished run.
+
+expand_polytomies
+    Write the orthologs of a run's polytomies (gene tree nodes of more
+    than two children) one row per pair of children, in a copy of the
+    ortholog files.
+
 """,
     # preview
     """view_results
@@ -63,6 +77,7 @@ Examples
 primary_transcript --help
 make_ultrametric --help
 split_ortholog_files --help
+trim_msa --help
 """,
     # preview
     """view_results --help

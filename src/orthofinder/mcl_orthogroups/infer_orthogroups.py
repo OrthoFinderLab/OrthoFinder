@@ -18,37 +18,42 @@ def write_graph_per_species(args):
     seqs_info, graph_fn, i_spec, d_pickle = args
     # calculate the 2-way connections for one query species
     with open(graph_fn + "_%d" % i_spec, "w", encoding="utf-8", newline="\n") as graph_file:
-        connect2 = []
-        for j_spec in range(seqs_info.n_species):
-            m1 = matrices.load_matrix("connect", i_spec, j_spec, d_pickle)
-            m2tr = numeric.transpose(
-                matrices.load_matrix("connect", j_spec, i_spec, d_pickle)
-            )
-            connect2.append(m1 + m2tr)
-            del m1, m2tr
         B = matrices.load_matrix_array("B", seqs_info, i_spec, d_pickle)
-        b_connect = matrices.matrices_and_s(connect2, B)
-        del B, connect2
-
-        # CSR with sorted columns: each row's entries are a slice of the arrays,
-        # instead of creating a row view per gene per species.
-        def csr_sorted(b):
-            # sorted_indices() always copies; only call it if the indices are not sorted.
-            b = b.tocsr()
-            return b if b.has_sorted_indices else b.sorted_indices()
-        W = [csr_sorted(b) for b in b_connect]
-        del b_connect
-        W = [(w.indptr, w.indices, w.data) for w in W]
+        # The weights of each species' block (connections both ways, times the scores), a block at
+        # a time, joined into one CSR of all the species' columns (column j_offset + j): a CSR of
+        # each block held for every species would be a row pointer per gene per species
+        rows, cols, values = [], [], []
+        for j_spec in range(seqs_info.n_species):
+            m1 = matrices.as_csr(matrices.load_matrix("connect", i_spec, j_spec, d_pickle))
+            m2tr = numeric.transpose(
+                matrices.as_csr(matrices.load_matrix("connect", j_spec, i_spec, d_pickle))
+            )
+            w = matrices.as_csr((m1 + m2tr).multiply(matrices.as_csr(B[j_spec])))
+            del m1, m2tr
+            B[j_spec] = None
+            # (sorted columns: sorted_indices() always copies, only if they are not)
+            w = w if w.has_sorted_indices else w.sorted_indices()
+            rows.append(np.repeat(np.arange(w.shape[0]), np.diff(w.indptr)))
+            cols.append(w.indices.astype(np.int64) + seqs_info.seq_starting_indices[j_spec])
+            values.append(w.data)
+            del w
+        del B
+        # (in each row the species in order, each one's columns in order: a stable sort by row)
+        rows = np.concatenate(rows) if rows else np.zeros(0, dtype=np.int64)
+        order = np.argsort(rows, kind="stable")
+        indices = np.concatenate(cols)[order] if cols else np.zeros(0, dtype=np.int64)
+        data = np.concatenate(values)[order] if values else np.zeros(0)
+        n_query = seqs_info.n_seqs_per_species[seqs_info.species_to_use[i_spec]]
+        indptr = np.zeros(n_query + 1, dtype=np.int64)
+        np.cumsum(np.bincount(rows, minlength=n_query), out=indptr[1:])
+        del rows, cols, values, order
         offset = seqs_info.seq_starting_indices[i_spec]
-        j_offsets = [seqs_info.seq_starting_indices[j_spec] for j_spec in range(seqs_info.n_species)]
-        for query in range(seqs_info.n_seqs_per_species[seqs_info.species_to_use[i_spec]]):
+        for query in range(n_query):
             parts = ["%d    " % (offset + query)]
-            for (indptr, indices, data), j_offset in zip(W, j_offsets):
-                a, b = indptr[query], indptr[query + 1]
-                if a == b:
-                    continue
+            a, b = indptr[query], indptr[query + 1]
+            if a != b:
                 parts.extend(
-                    "%d:%.3f " % (j + j_offset, value)
+                    "%d:%.3f " % (j, value)
                     for j, value in zip(indices[a:b].tolist(), data[a:b].tolist())
                 )
             parts.append("$\n")
@@ -64,9 +69,9 @@ def write_graph_per_species_homology(args):
     # W = [matrices.load_matrix("B", iSpec, jSpec, d_pickle).tolil() for jSpec in range(seqsInfo.nSpecies)]
     W = []
     for j_spec in range(seqs_info.n_species):
-        w1 = matrices.load_matrix("B", i_spec, j_spec, d_pickle)
+        w1 = matrices.as_csr(matrices.load_matrix("B", i_spec, j_spec, d_pickle))
         matrices.dump_matrix("H", (w1 > 0).tolil(), i_spec, j_spec, d_pickle)
-        w2tr = numeric.transpose(matrices.load_matrix("B", j_spec, i_spec, d_pickle))
+        w2tr = numeric.transpose(matrices.as_csr(matrices.load_matrix("B", j_spec, i_spec, d_pickle)))
         W.append((w1 + w2tr > 0).tolil())  # symmetrise
     # matrices.dump_matrix_array("H", W, iSpec, d_pickle)
     with open(graph_fn + "_%d" % i_spec, "w", encoding="utf-8", newline="\n") as graph_file:

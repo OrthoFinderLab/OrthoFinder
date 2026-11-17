@@ -184,7 +184,6 @@ def run_parallel_commands(
     method_threads=None,
     cmd_order="descending",
     tasksize=None,
-    q_trim=False,
     q_print_on_error=False,
     q_always_print_stderr=False,
     on_success=None,
@@ -193,12 +192,17 @@ def run_parallel_commands(
     on_success: called in this process with each command that succeeds (exit 0),
     e.g. to record finished searches; an error in it is reported, not raised.
     """
+    total = None
     if q_list_of_list:
         commands_and_no_filenames = [
             [(cmd, None) for cmd in cmd_list] for cmd_list in commands
         ]
-    else:
+    elif isinstance(commands, list):
         commands_and_no_filenames = [(cmd, None) for cmd in commands]
+    else:
+        # (e.g. search.commands.SearchCommands: each made as it is started, not all held)
+        commands_and_no_filenames = ((cmd, None) for cmd in commands)
+        total = len(commands)
     run_parallel_commands_and_move_results_file(
         n_processes,
         commands_and_no_filenames,
@@ -206,11 +210,14 @@ def run_parallel_commands(
         method_threads,
         cmd_order,
         tasksize,
-        q_trim,
         q_print_on_error,
         q_always_print_stderr,
         on_success=on_success,
+        total=total,
     )
+
+
+_END = object()     # (the end of an iterator of commands)
 
 
 def _run_parallel_commands_and_move_results_file(
@@ -220,15 +227,19 @@ def _run_parallel_commands_and_move_results_file(
     method_threads=None,
     cmd_order="descending",
     tasksize=None,
-    q_trim=False,
     q_print_on_error=False,
     q_always_print_stderr=False,
     on_success=None,
     follow_up=None,
     progress=None,
+    on_function_result=None,
+    total=None,
 ):
     """
     Calls the commands in parallel and if required moves the results file to the required new filename
+
+    commands_and_filenames is a list, or an iterator of total commands, each
+    taken from it as it is started (with q_list_of_list False).
 
     The commands are started in the order given, at most n_processes at a
     time. A python function in a list of commands (e.g. trimming) is run in a
@@ -240,6 +251,9 @@ def _run_parallel_commands_and_move_results_file(
 
     progress: what shows the progress (see Progress), by default a progress bar
     for the whole batch.
+
+    on_function_result: called (in a thread of this process) with what a
+    python function in the commands returns, if not None.
     Args:
         nProcess - the number of parallel process to use
         commands_and_filenames : tuple (cmd, actual_target_fn) where actual_target_fn = None if no move is required
@@ -252,13 +266,21 @@ def _run_parallel_commands_and_move_results_file(
                       of the inner list need to be run in the order they appear.
         q_print_on_error - If error code returned print stdout & stderr
     """
-    queued = collections.deque(cmd_unit for cmd_unit in commands_and_filenames if cmd_unit is not None)
-    total_commands = len(queued)
+    if total is None:
+        queued = collections.deque(cmd_unit for cmd_unit in commands_and_filenames if cmd_unit is not None)
+        total_commands = len(queued)
+        source = None
+    else:
+        # (the commands not yet started, taken as needed; queued: those of follow_up, first)
+        queued = collections.deque()
+        total_commands = total
+        source = iter(commands_and_filenames)
     if method_threads is None:
         method_threads = "1"
 
 
-    n_processes = max(1, min((n_processes, len(commands_and_filenames), TOTAL_CORES * 4)))
+    n_processes = max(1, min((n_processes, total_commands if total is not None else len(commands_and_filenames),
+                              TOTAL_CORES * 4)))
 
     # Started before the threads and the progress bar: forking a process
     # while another thread holds a lock can leave the child stuck on it.
@@ -272,11 +294,25 @@ def _run_parallel_commands_and_move_results_file(
         futures = {}
         running = set()
 
+        def next_unit():
+            nonlocal source
+            if queued:
+                return queued.popleft()
+            while source is not None:
+                cmd_unit = next(source, _END)
+                if cmd_unit is _END:
+                    source = None
+                elif cmd_unit is not None:      # (None: not a command, as in a list)
+                    return cmd_unit
+            return None
+
         def start_queued():
             # Only n_processes are handed to the pool at a time, so that commands
             # returned by follow_up can still go ahead of the queued ones.
-            while queued and len(running) < n_processes:
-                cmd_unit = queued.popleft()
+            while len(running) < n_processes:
+                cmd_unit = next_unit()
+                if cmd_unit is None:
+                    break
                 fut = executor.submit(
                     worker_run_commands_and_move,
                     cmd_unit,
@@ -285,6 +321,7 @@ def _run_parallel_commands_and_move_results_file(
                     q_print_on_error,
                     q_always_print_stderr,
                     function_pool=function_pool,
+                    on_function_result=on_function_result,
                 )
                 futures[fut] = cmd_unit
                 running.add(fut)
@@ -316,12 +353,16 @@ def _run_parallel_commands_and_move_results_file(
                         next_units = list(follow_up(futures[future]))
                         queued.extendleft(reversed(next_units))
                         progress.added(len(next_units))
+                    # (done with: only the running ones are kept, not one for every command)
+                    del futures[future]
+                    recorded.discard(future)
                 start_queued()
         except BaseException:
             # A command failed or we were interrupted: don't start queued
             # commands and stop running ones, otherwise leaving the pool
             # would wait for all of them to finish.
             queued.clear()
+            source = None
             for fut in futures:
                 fut.cancel()
             parallel_task_manager.kill_running_commands()
@@ -453,6 +494,7 @@ def worker_run_commands_and_move(
     q_print_on_error,
     q_always_print_stderr,
     function_pool=None,
+    on_function_result=None,
 ):
     """
     Continuously takes commands that need to be run from the cmd_and_filename_queue until the queue is empty. If required, moves
@@ -485,9 +527,11 @@ def worker_run_commands_and_move(
             if isinstance(command, types.FunctionType):
                 fn = command
                 if function_pool is None:
-                    fn(*fns)
+                    result = fn(*fns)
                 else:
-                    function_pool.run(fn, fns)
+                    result = function_pool.run(fn, fns)
+                if result is not None and on_function_result is not None:
+                    on_function_result(result)
                 return_code = 0
             else:
                 if not isinstance(command, str):

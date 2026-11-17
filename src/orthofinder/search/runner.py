@@ -10,6 +10,8 @@ from ..run import previous_run
 # from .. import my_env
 import os
 import re
+
+import numpy as np
 import time
 from ..utils import printing
 from ..utils import command_runner
@@ -104,7 +106,7 @@ def run_search(
     if options.q_stop_after_prepare:
         # -op: the commands are run outside OrthoFinder, which would otherwise
         # fill in the thread count when running them
-        saved = [command_runner.fill_method_threads(c, options.method_threads)[1] for c in commands]
+        saved = (command_runner.fill_method_threads(c, options.method_threads)[1] for c in commands)
     else:
         saved = commands
     with open(commands_fn, "w", encoding="utf-8", newline="\n") as writer:
@@ -123,12 +125,15 @@ def run_search(
     if only_missing:
         # continuing a run (-b): only the searches whose results are missing
         # or incomplete (checkpoint.txt), e.g. not those run on a cluster
-        to_create = dict(previous_run.results_to_create([results_written_by(c) for c in commands]))
-        for fn, path in to_create.items():
+        # (a command at a time: not a list of every results file, with the commands made as needed)
+        keep = np.zeros(len(commands), dtype=bool)
+        for k, fn, path in previous_run.results_to_create_of(results_written_by(c) for c in commands):
+            keep[k] = True
             if path is not None:
                 os.replace(path, path + ".incomplete")
                 printer.print("Incomplete search results moved aside: %s.incomplete" % path)
-        commands = [c for c in commands if results_written_by(c) in to_create]
+        commands = commands.subset(keep) if hasattr(commands, "subset") \
+            else [c for c, q in zip(commands, keep) if q]
         printer.print("%d of the searches are to be run (the others' results are complete)" % len(commands))
     # Logged only when the searches run (not with -op): a restart judges from
     # these whether the searches were interrupted (file_io.search_checkpoint).
@@ -364,6 +369,9 @@ _TMP_IN_COMMAND = re.compile(r"""(/\S*/tmp\S*Blast\d+_-?\d+\.txt)(?=[\s;&|]|$)""
 
 def remove_search_tmp_dirs(commands):
     """Remove the temporary folders the search commands named (MMseqs2), once they have run."""
+    if len(commands) == 0 or not _TMP_IN_COMMAND.findall(commands[0]):
+        # (the commands of a search are of one program: none names a folder if the first does not)
+        return
     for command in commands:
         for d in _TMP_IN_COMMAND.findall(command):
             if os.path.isdir(d):

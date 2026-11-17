@@ -79,6 +79,47 @@ def _cgroup_memory_limit_mb():
     return None
 
 
+def _slurm_memory_mb():
+    """The memory of a SLURM job on this node in MB (--mem, or --mem-per-cpu times its cores), None if none."""
+    per_node = os.environ.get("SLURM_MEM_PER_NODE")
+    if per_node and per_node.isdigit() and int(per_node) > 0:
+        return int(per_node)
+    per_cpu, cpus = os.environ.get("SLURM_MEM_PER_CPU"), os.environ.get("SLURM_CPUS_ON_NODE")
+    if per_cpu and per_cpu.isdigit() and cpus and cpus.isdigit():
+        return int(per_cpu) * int(cpus)
+    return None
+
+
+_usable_memory = []
+
+
+def usable_memory_bytes():
+    """
+    The memory this run can use, in bytes: the least of the computer's, what
+    it has available when first asked (other programs' use), and the limit of a
+    cluster job or container (cgroup, SLURM). None if none can be read. Read
+    once (a fixed value for the run, whatever the others use later).
+    """
+    if not _usable_memory:
+        memory = _safe(_memory_mb, {}) or {}
+        values = [memory.get("total"), memory.get("available"), _safe(_slurm_memory_mb)]
+        if platform.system() == "Linux":
+            values.append(_safe(_cgroup_memory_limit_mb))
+        values = [v for v in values if v]
+        _usable_memory.append(min(values) * 1024 * 1024 if values else None)
+    return _usable_memory[0]
+
+
+def memory_budget(minimum, fraction):
+    """
+    A memory limit of a step: fraction of the memory the run can use
+    (usable_memory_bytes), at least minimum (also if it cannot be read). Only
+    how much is held at once, so the speed, depends on it, never the results.
+    """
+    usable = usable_memory_bytes()
+    return minimum if usable is None else max(minimum, int(usable * fraction))
+
+
 def _open_files_limit():
     """{"soft", "hard"} open-file limits now (after OrthoFinder raised the soft one); None: unlimited."""
     import resource

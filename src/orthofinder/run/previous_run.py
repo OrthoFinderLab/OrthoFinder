@@ -185,6 +185,14 @@ def results_to_create(required):
     or incomplete, as (filename, incomplete file or None): see
     get_blast_results_to_create.
     """
+    return [(fn, path) for _, fn, path in results_to_create_of(required)]
+
+
+def results_to_create_of(required):
+    """
+    results_to_create of an iterable of files, one at a time: (its index in
+    required, filename, incomplete file or None) of each missing or incomplete.
+    """
     checkpoints = {}
     def complete(path):
         d, name = os.path.split(path)
@@ -193,14 +201,12 @@ def results_to_create(required):
         interrupted, done = checkpoints[d]
         return not interrupted or done.get(name) == os.path.getsize(path)
 
-    to_create = []
-    for fn in required:
+    for k, fn in enumerate(required):
         path = fn + ".gz" if os.path.exists(fn + ".gz") else fn if os.path.exists(fn) else None
         if path is None:
-            to_create.append((fn, None))
+            yield k, fn, None
         elif not complete(path):
-            to_create.append((fn, path))
-    return to_create
+            yield k, fn, path
 
 
 def process_previous_files(working_dir_list, q_double_blast, check_blast=True):

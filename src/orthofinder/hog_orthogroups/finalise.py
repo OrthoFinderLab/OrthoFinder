@@ -57,6 +57,19 @@ def update_output_files(
 
     if prev_wd is not None:
         align_id_dir = os.path.join(prev_wd, "Alignments_ids")
+
+    # --keep-dropped: the columns trimming removed, of each MSA
+    dropped_dir = None
+    fasta_dropped_index = {}
+    if exist_msa and getattr(options, "keep_dropped", False):
+        dropped_id_dir = (os.path.join(prev_wd, "Alignments_dropped_ids") if prev_wd is not None
+                          else file_handler.handler.get_align_dropped_id_dir())
+        if os.path.isdir(dropped_id_dir):
+            fasta_dropped_index = index_files(dropped_id_dir, ".fa")
+            dropped_dir = file_handler.handler.get_results_align_dropped_dir()
+        else:
+            print("WARNING: --keep-dropped, but the MSAs were trimmed without it: there are no dropped "
+                  "columns to save. Run from the orthogroups (-fg) with --keep-dropped to have them.")
     old_hog_n0 = read_hog_file(hog_n0_file)
     hog_n0_over4genes = hog_file_over4genes(old_hog_n0, 2)
 
@@ -97,7 +110,10 @@ def update_output_files(
         fasta_file_index,  
         align_dir=align_dir,
         min_seq=options.min_seq,
-        exist_msa=exist_msa
+        exist_msa=exist_msa,
+        fasta_dropped_index=fasta_dropped_index,
+        dropped_dir=dropped_dir,
+        dropped_gaps=getattr(options, "trim_gaps", "-"),
     )
 
 

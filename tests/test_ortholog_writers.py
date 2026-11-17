@@ -1,4 +1,5 @@
 import gzip
+import os
 import random
 import subprocess
 
@@ -183,3 +184,23 @@ def test_resolved_tree_not_written_stops_the_run(tmp_path, monkeypatch):
     monkeypatch.setattr(tree_analyser.phylo_taxa, "rename_tree_taxa", fails)
     with pytest.raises(WorkerError, match="OG0000005"):
         ta.write_resolved_tree(None, 5)
+
+
+def test_ordered_committer_spill_segments_freed(tmp_path, monkeypatch):
+    # (each spill segment deleted once all of it is read back: the disk used is what is pending)
+    monkeypatch.setattr(OrderedCommitter, "SPILL_SEGMENT_BYTES", 300)
+    committed = []
+    iogs = list(range(60))
+    committer = OrderedCommitter(committed.append, iogs, max_pending_bytes=0, spill_dir=str(tmp_path))
+    sizes = []
+    for start in range(0, 60, 10):
+        # each batch held back by its first OG, then released
+        for iog in range(start + 1, start + 10):
+            committer.add_result(iog, {"iog": iog, "text": "x" * 50})
+        sizes.append(len(os.listdir(tmp_path)))
+        committer.add_result(start, {"iog": start, "text": ""})
+        assert os.listdir(tmp_path) == []           # (none pending: nothing on disk)
+    committer.assert_finished()
+    committer.close()
+    assert [d["iog"] for d in committed] == iogs
+    assert max(sizes) > 1                           # (several segments while pending)

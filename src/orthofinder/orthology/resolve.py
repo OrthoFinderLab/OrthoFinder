@@ -495,7 +495,9 @@ def resolve(n, M):
 def resolve_tree(tree, GeneToSpecies):
     if tree is None:
         raise ValueError("Resolve got tree=None")
-    store_species_sets(tree, GeneToSpecies)
+    # (only the species below each node are used: not those above, nearly all
+    # of them at every node)
+    store_species_sets(tree, GeneToSpecies, q_up=False)
     for n in tree.traverse("postorder"):
         new_tree = resolve(n, GeneToSpecies)
         if new_tree is not None:

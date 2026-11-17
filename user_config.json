@@ -12,6 +12,7 @@
     "__comment": "GAPEXTEND: Gap extend penalty used in DIAMOND search (--gapextend, default: the matrix's, 1 for BLOSUM62)",
     "__comment": "METHODTHREAD: Number of threads used by different methods",
     "__comment": "Species tree programs (program_type species_tree, chosen with -ST): INPUT is the gene trees, one per line, their leaves named by species ID; OUTPUT the species tree they write (Newick); METHODTHREAD the number of threads (-t). See astral-pro in config.json for an example.",
+    "__comment": "Trimming programs (program_type trim, chosen with --trim, default clipkit): cmd_line writes the trimmed alignment of INPUT to OUTPUT. For --keep-dropped the program must also write the columns it removes, either with a second command, cmd_line_dropped, writing them to OUTPUT (output mode paired), or by cmd_line itself to OUTPUT followed by complement_suffix (output mode single_with_complement). STDOUT is where a program's messages go (they are not kept). sequence_type (protein or dna, optional) is for a command that only trims one of them, e.g. bmge, which is told the type. gap_characters (optional) gives the characters the program treats as gaps or unknown, for protein and for dna (-d) alignments, e.g. {\"protein\": \"-?*X\", \"dna\": \"-?*XN\"}. A sequence the program leaves with only these has no residues. cmd_line_large_n with large_n (optional, together) is the command for an alignment of large_n sequences or more. If the program removes every column, fails or leaves a sequence without residues, the alignment is kept untrimmed. Without it they are - and *. Entries of trimmiy's config.json with these output modes can be used as they are (cmd_line_kept for cmd_line).",
     "__comment": "Search results: OrthoFinder reads the query ID, subject ID and bit score (and the e-value with --assign) of each hit, as tab-separated columns. Their positions are read from the output options in search_cmd: BLAST+ -outfmt 6 or 7 (with or without a column list, e.g. -outfmt \"6 qseqid sseqid evalue bitscore\"), DIAMOND --outfmt 6 (e.g. --outfmt 6 qseqid sseqid bitscore evalue) and MMseqs2 --format-output/--format-mode 0 or 4. Without such options the standard 12 BLAST tabular columns are expected (qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore).",
     "__comment": "output_fields (optional, search entries): for another search program, the columns its results have, in order, using the BLAST names, e.g. \"output_fields\": \"qseqid sseqid evalue bitscore\". It must include qseqid, sseqid and bitscore (and evalue to use --assign).",
     "muscle": {
@@ -49,6 +50,38 @@
         "program_type": "tree",
         "cmd_line": "iqtree3 -s INPUT --prefix PATH/IDENTIFIER -T METHODTHREAD --seed 12345 -quiet",
         "output_filename": "PATH/IDENTIFIER.treefile"
+    },
+    "trimal": {
+        "program_type": "trim",
+        "cmd_line": "trimal -in INPUT -out OUTPUT -automated1",
+        "cmd_line_dropped": "trimal -in INPUT -out OUTPUT -automated1 -complementary",
+        "gap_characters": {"protein": "-X", "dna": "-N"}
+    },
+    "clipkit": {
+        "program_type": "trim",
+        "cmd_line": "clipkit INPUT -o OUTPUT -c > STDOUT",
+        "cmd_line_large_n": "clipkit INPUT -o OUTPUT -c -m kpic > STDOUT",
+        "large_n": 1000,
+        "complement_suffix": ".complement",
+        "gap_characters": {"protein": "-?*Xx", "dna": "-?*XxNn"}
+    },
+    "clipkit-kpic-smart-gap": {
+        "program_type": "trim",
+        "cmd_line": "clipkit INPUT -o OUTPUT -c -m kpic-smart-gap > STDOUT",
+        "complement_suffix": ".complement",
+        "gap_characters": {"protein": "-?*Xx", "dna": "-?*XxNn"}
+    },
+    "bmge": {
+        "program_type": "trim",
+        "cmd_line": "bmge -i INPUT -t AA -of OUTPUT > STDOUT",
+        "sequence_type": "protein",
+        "gap_characters": {"protein": "-?X"}
+    },
+    "bmge-dna": {
+        "program_type": "trim",
+        "cmd_line": "bmge -i INPUT -t DNA -of OUTPUT > STDOUT",
+        "sequence_type": "dna",
+        "gap_characters": {"dna": "-?NX"}
     },
     "diamond": {
         "program_type": "search",

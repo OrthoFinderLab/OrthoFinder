@@ -1,6 +1,7 @@
 """Rooting gene trees: the root that best separates the species, as in the species tree."""
 
 import operator
+from collections import Counter
 import os
 
 from ..phylo import tree as tree_lib
@@ -84,8 +85,11 @@ def get_roots(tree, species_tree_rooted, GeneToSpecies):
     scores_list = []   # the fraction completeness of the two clades
 #    roots_set = set()
     # Species below/above each node: the same for every split, so computed once
-    # (the tree is not modified in this loop).
-    store_species_sets(tree, GeneToSpecies)   # sets of species
+    # (the tree is not modified in this loop). As bitmasks, not sets: a set of
+    # the species above a node holds nearly all of them at every node (GBs for
+    # a tree of tens of thousands of genes of a thousand species).
+    bit_of = {sp: 1 << i for i, sp in enumerate(sorted(species_observed, key=str))}
+    store_species_masks(tree, GeneToSpecies, bit_of)
     for i in range(len(leaves)):
         t1 = leaves[i]
         t2 = set.union(*[l for j,l in enumerate(leaves) if j!=i])
@@ -93,8 +97,8 @@ def get_roots(tree, species_tree_rooted, GeneToSpecies):
         # First relevant split in species tree is (A,B), such that A \cap G \neq \emptyset and A \cap G \neq \emptyset
         # label all nodes in gene tree according the whether subsets of A, B or both lie below node
         root_mapper = RootMap(t1, t2, GeneToSpecies)    
-        sett1 = set(t1)
-        sett2 = set(t2)
+        mask1 = species_mask(t1, bit_of)
+        mask2 = species_mask(t2, bit_of)
         nt1 = float(len(t1))
         nt2 = float(len(t2))
         n_recip = 1./(nt1*nt1*nt2*nt2)
@@ -129,18 +133,14 @@ def get_roots(tree, species_tree_rooted, GeneToSpecies):
                         ab = [c == TF for c in clades]
                         i = ab.index(True)
                         roots_list.append(nodes[i])
-                        sp_down = nodes[i].sp_down
-                        sp_up = nodes[i].sp_up
-#                        print(m)
-                        scores_list.append(outgroup_ingroup_separation_score(sp_up, sp_down, sett1, sett2, n_recip, nt1, nt2))
+                        scores_list.append(outgroup_ingroup_separation_score(
+                            nodes[i].spm_up, nodes[i].spm_down, mask1, mask2, n_recip, nt1, nt2))
                     elif clades.count(TF) >= 2:  
                         # (A,A,A)-excluded, (A,A,AB)-ignore as want A to be biggest without including B, (A,AB,AB), (AB,AB,AB) 
                         i = 0
                         roots_list.append(nodes[i])
-                        sp_down = nodes[i].sp_down
-                        sp_up = nodes[i].sp_up
-#                        print(m)
-                        scores_list.append(outgroup_ingroup_separation_score(sp_up, sp_down, sett1, sett2, n_recip, nt1, nt2))
+                        scores_list.append(outgroup_ingroup_separation_score(
+                            nodes[i].spm_up, nodes[i].spm_down, mask1, mask2, n_recip, nt1, nt2))
                 elif T in clades and F in clades:
                     roots_list.append(m)
                     scores_list.append(0)  # last choice
@@ -150,7 +150,58 @@ def get_roots(tree, species_tree_rooted, GeneToSpecies):
     return [sorted(zip(scores_list, roots_list), key=lambda x: x[0], reverse=True)[0][1]]
 
 
-def store_species_sets(t, gene_map, tag="sp_"):
+def species_mask(species, bit_of):
+    """The bitmask of species (bit_of: species -> its bit; those without one, none)."""
+    mask = 0
+    for sp in species:
+        mask |= bit_of.get(sp, 0)
+    return mask
+
+
+def store_species_masks(t, gene_map, bit_of):
+    """
+    store_species_sets's sp_down and sp_up, as bitmasks of the species
+    (bit_of: species -> its bit): spm_down and spm_up. A bitmask of a thousand
+    species is ~160 bytes, a set of them ~30 KB.
+    """
+    for node in t.traverse('postorder'):
+        if node.is_leaf():
+            node.add_feature("spm_down", bit_of.get(gene_map(node.name), 0))
+        elif not node.is_root():
+            down = 0
+            for ch in node.get_children():
+                down |= ch.spm_down
+            node.add_feature("spm_down", down)
+    # (as store_species_sets: a pass over a polytomy's children, those in only
+    # one child found with the species in two or more, twice)
+    t.add_feature("spm_up", 0)
+    for node in t.traverse('preorder'):
+        ch = node.get_children()
+        if not ch:
+            continue
+        up = node.spm_up
+        if len(ch) == 2:
+            ch[0].add_feature("spm_up", up | ch[1].spm_down)
+            ch[1].add_feature("spm_up", up | ch[0].spm_down)
+            continue
+        once = twice = 0
+        for c in ch:
+            twice |= once & c.spm_down
+            once |= c.spm_down
+        all_up = up | once
+        for c in ch:
+            c.add_feature("spm_up", all_up & ~(c.spm_down & ~twice & ~up))
+    down = 0
+    for ch in t.get_children():
+        down |= ch.spm_down
+    t.add_feature("spm_down", down)
+
+
+def store_species_sets(t, gene_map, tag="sp_", q_up=True):
+    """
+    The species below each node (tag + "down") and, if q_up, those outside
+    its clade (tag + "up"), as sets (see store_species_masks for bitmasks).
+    """
     if t is None:
         raise ValueError("StoreSpeciesSets got t=None (tree is None)")
     tag_up = tag + "up"
@@ -163,24 +214,42 @@ def store_species_sets(t, gene_map, tag="sp_"):
             continue
         else:
             node.add_feature(tag_down, set.union(*[ch.__getattribute__(tag_down) for ch in node.get_children()]))
+    # The species of a node's tree outside its clade (tag_up): its parent's,
+    # and those below its siblings. At a polytomy, a pass over the children
+    # (not a union of every other child's for each child: quadratic, hours for
+    # tens of thousands of identical sequences, FastTree's polytomies), and
+    # the children with no species of their own share one set (the sets are
+    # replaced, never changed in place).
+    if not q_up:
+        t.add_feature(tag_down, set.union(*[ch.__getattribute__(tag_down) for ch in t.get_children()]))
+        return
+    t.add_feature(tag_up, set())
     for node in t.traverse('preorder'):
-        if node.is_root():
-            node.add_feature(tag_up, set())
-        else:
-            parent = node.up
-            if parent.is_root():
-                others = [ch for ch in parent.get_children() if ch != node]
-                node.add_feature(tag_up, set.union(*[other.__getattribute__(tag_down) for other in others]))
-            else:
-                others = [ch for ch in parent.get_children() if ch != node]
-                sp_downs = set.union(*[other.__getattribute__(tag_down) for other in others])
-                node.add_feature(tag_up, parent.__getattribute__(tag_up).union(sp_downs))
+        ch = node.get_children()
+        if not ch:
+            continue
+        up = node.__getattribute__(tag_up)
+        downs = [c.__getattribute__(tag_down) for c in ch]
+        if len(ch) == 2:
+            ch[0].add_feature(tag_up, up.union(downs[1]))
+            ch[1].add_feature(tag_up, up.union(downs[0]))
+            continue
+        n_children_with = Counter()
+        for down in downs:
+            n_children_with.update(down)
+        all_up = up.union(n_children_with)
+        for c, down in zip(ch, downs):
+            only_here = {sp for sp in down if n_children_with[sp] == 1 and sp not in up}
+            c.add_feature(tag_up, all_up - only_here if only_here else all_up)
     t.add_feature(tag_down, set.union(*[ch.__getattribute__(tag_down) for ch in t.get_children()]))
 
 
-def outgroup_ingroup_separation_score(sp_up, sp_down, sett1, sett2, n_recip, n1, n2):
-    f_dup = len(sp_up.intersection(sett1)) * len(sp_up.intersection(sett2)) * len(sp_down.intersection(sett1)) * len(sp_down.intersection(sett2)) * n_recip
-    f_a = len(sp_up.intersection(sett1)) * (n2-len(sp_up.intersection(sett2))) * (n1-len(sp_down.intersection(sett1))) * len(sp_down.intersection(sett2)) * n_recip
-    f_b = (n1-len(sp_up.intersection(sett1))) * len(sp_up.intersection(sett2)) * len(sp_down.intersection(sett1)) * (n2-len(sp_down.intersection(sett2))) * n_recip
+def outgroup_ingroup_separation_score(up, down, mask1, mask2, n_recip, n1, n2):
+    """(the species above and below the node, and of the two sides of the split, as bitmasks)"""
+    up1, up2 = (up & mask1).bit_count(), (up & mask2).bit_count()
+    down1, down2 = (down & mask1).bit_count(), (down & mask2).bit_count()
+    f_dup = up1 * up2 * down1 * down2 * n_recip
+    f_a = up1 * (n2 - up2) * (n1 - down1) * down2 * n_recip
+    f_b = (n1 - up1) * up2 * down1 * (n2 - down2) * n_recip
     choice = (f_dup, f_a, f_b)
     return max(choice)

@@ -357,10 +357,10 @@ OUTPUT_FIELDS_COMMENT = "# output_fields:"
 
 def commands_file_lines(commands, fmt):
     """The lines of blast_commands.txt: the commands, after the declared columns if any."""
-    lines = []
     if fmt is not None and fmt.declared:
-        lines.append("%s %s" % (OUTPUT_FIELDS_COMMENT, " ".join(fmt.fields)))
-    return lines + list(commands)
+        yield "%s %s" % (OUTPUT_FIELDS_COMMENT, " ".join(fmt.fields))
+    for command in commands:
+        yield command
 
 
 _hit_format_cache = {}

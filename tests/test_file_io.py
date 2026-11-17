@@ -241,11 +241,11 @@ def test_hit_format_from_blast_commands(tmp_path):
     assert fmt.fields == ("qseqid", "sseqid", "bitscore") and fmt.header
     # columns declared in the config ("output_fields") come first, as a comment
     declared = file_io.search_hit_format("mytool -i IN -o OUT", declared_fields="sseqid qseqid bitscore")
-    lines = file_io.commands_file_lines(["mytool -i a -o Blast0_0.txt"], declared)
+    lines = list(file_io.commands_file_lines(["mytool -i a -o Blast0_0.txt"], declared))
     assert lines[0] == "# output_fields: sseqid qseqid bitscore"
     d = commands_dir("custom", lines)
     assert file_io.hit_format(str(d / "Blast0_0.txt")).fields == ("sseqid", "qseqid", "bitscore")
-    assert file_io.commands_file_lines(["blastp -outfmt 6"], file_io.STANDARD_HIT_FORMAT) == ["blastp -outfmt 6"]
+    assert list(file_io.commands_file_lines(["blastp -outfmt 6"], file_io.STANDARD_HIT_FORMAT)) == ["blastp -outfmt 6"]
     # results made outside OrthoFinder: the standard columns
     assert file_io.hit_format(str(tmp_path / "none" / "Blast0_0.txt")).assumed
 

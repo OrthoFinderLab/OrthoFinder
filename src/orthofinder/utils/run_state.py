@@ -243,7 +243,7 @@ def command_key(command):
     alignment of the species tree. None if it runs no program.
     """
     first = re.split(r"\n|;|&&|\|\||\|", command, maxsplit=1)[0].split()
-    while first and _ASSIGNMENT.match(first[0]):
+    while first and (first[0] == "{" or _ASSIGNMENT.match(first[0])):     # (a group, as programs')
         first.pop(0)
     if not first:
         return None
@@ -384,7 +384,9 @@ SETTINGS = (
     ("tree_program", ("-T", "--tree-program")),
     ("min_seq", ("-ms", "--min-seq")),
     ("msa_min_seq", ("--msa-min-seq",)),
-    ("q_trim", ("-z",)),
+    ("q_trim", ("-z", "--trim")),
+    ("trim_program", ("-z", "--trim")),
+    # (not --keep-dropped: an extra output, as -mog and --orthoxml, off unless given)
     ("species_tree_program", ("-ST", "--species-tree-program")),
     ("n_skip", ("-nk",)),
     ("q_split_para_clades", ("-y",)),

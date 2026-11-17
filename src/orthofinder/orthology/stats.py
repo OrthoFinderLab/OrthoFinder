@@ -435,6 +435,23 @@ class NOrthoSp(object):
             (n_sp, n_sp), dtype=dtype
         )  # genes in i that are in a many-to-many orthology relationship with genes in j
 
+    @staticmethod
+    def n_bytes(n_sp):
+        """The memory of the counts of n_sp species."""
+        return 5 * n_sp * n_sp * np.dtype(np.uint64).itemsize
+
+    def matrices(self):
+        return self.n, self.n_121, self.n_12m, self.n_m21, self.n_m2m
+
+    def add_block(self, block):
+        """The counts a worker sent (StreamedCounts)."""
+        kind, data = block
+        if kind == "pairs":
+            self.add_pairs(data)
+        else:
+            for m, (where, values) in zip(self.matrices(), data):
+                m.ravel()[where] += values      # (each index once: a matrix's nonzero entries)
+
     def __iadd__(self, other):
         self.n += other.n
         self.n_121 += other.n_121
@@ -463,3 +480,136 @@ class NOrthoSp(object):
         else:
             self.n_m2m[i_l, i_r] += n_l
             self.n_m2m[i_r, i_l] += n_r
+
+    def add_polytomy(self, idx, disjoint, c1, cm, sm):
+        """
+        add_pair for every pair of children of a polytomy with no species in
+        common, without listing the pairs (tree_analyser.polytomy_orthologs):
+        its children grouped by their species, disjoint (a
+        tree_analyser.DisjointGroups) whether two groups have no species in
+        common, its dot() the groups x groups 0/1 matrix times a matrix, and for each group
+        (rows) and species (columns, the species idx) c1 its children with one
+        gene of that species, cm those with more, sm the genes of those with
+        more. The sum of add_pair over the pairs of children is then a product
+        of these: n[x, y] = sum over disjoint groups g, h of (genes of x in g)
+        x (children with y in h), and so on.
+
+        As float64 (BLAS): exact while the counts are below 2^53.
+        """
+        d1 = disjoint.dot(c1)
+        dm = disjoint.dot(cm)
+        block = np.ix_(idx, idx)
+        for m, left, right in ((self.n, c1 + sm, d1 + dm), (self.n_121, c1, d1), (self.n_12m, c1, dm),
+                               (self.n_m21, sm, d1), (self.n_m2m, sm, dm)):
+            m[block] += np.rint(left.T @ right).astype(np.uint64)
+
+    def add_pairs(self, pairs):
+        """add_pair for each (iL, iR, nL, nR) of pairs, vectorised (np.add.at sums repeated pairs)."""
+        a = np.asarray(pairs, dtype=np.int64).reshape(-1, 4)
+        i_l, i_r = a[:, 0], a[:, 1]
+        n_l, n_r = a[:, 2].astype(np.uint64), a[:, 3].astype(np.uint64)
+        np.add.at(self.n, (i_l, i_r), n_l)
+        np.add.at(self.n, (i_r, i_l), n_r)
+        one_l, one_r = n_l == 1, n_r == 1
+        for m, mat_lr, val_lr, mat_rl, val_rl in (
+                (one_l & one_r, self.n_121, None, self.n_121, None),
+                (one_l & ~one_r, self.n_12m, None, self.n_m21, n_r),
+                (~one_l & one_r, self.n_m21, n_l, self.n_12m, None),
+                (~one_l & ~one_r, self.n_m2m, n_l, self.n_m2m, n_r)):
+            if not m.any():
+                continue
+            ones = np.ones(int(m.sum()), dtype=np.uint64)
+            np.add.at(mat_lr, (i_l[m], i_r[m]), ones if val_lr is None else val_lr[m])
+            np.add.at(mat_rl, (i_r[m], i_l[m]), ones if val_rl is None else val_rl[m])
+
+
+class StreamedCounts(object):
+    """
+    An analysis worker's ortholog counts, sent to the parent process in
+    blocks (send(block), to NOrthoSp.add_block) rather than held: a NOrthoSp
+    is 5 species x species matrices (0.93 GiB at 5,000 species), and only the
+    parent's is needed. The counts are whole numbers, so the parent's sums are
+    those it would have had. For PendingPairs.add_to, as a NOrthoSp: add_pair,
+    add_pairs and += (a tree's dense counts).
+    """
+
+    # The pairs held before they are sent, as numpy arrays (32 bytes a pair, not a Python tuple
+    # of four ints: about 150 bytes)
+    MAX_PAIRS = 65536
+
+    def __init__(self, send):
+        self.send = send
+        self.blocks = []        # n x 4 int64 arrays
+        self.n_pairs = 0
+        self.pairs = []         # (those of add_pair, until there are VECTOR_MIN)
+
+    def add_pair(self, i_l, i_r, n_l, n_r):
+        self.pairs.append((i_l, i_r, n_l, n_r))
+        if len(self.pairs) >= PendingPairs.VECTOR_MIN:
+            self.add_pairs([])
+
+    def add_pairs(self, pairs):
+        if self.pairs:
+            pairs, self.pairs = self.pairs + list(pairs), []
+        if len(pairs):
+            block = np.asarray(pairs, dtype=np.int64).reshape(-1, 4)
+            self.blocks.append(block)
+            self.n_pairs += len(block)
+            if self.n_pairs >= self.MAX_PAIRS:
+                self.flush()
+
+    def __iadd__(self, other):
+        # (a large tree's or a polytomy's dense counts: their entries, not the matrices)
+        self.send(("entries", [(np.flatnonzero(m), m.ravel()[np.flatnonzero(m)]) for m in other.matrices()]))
+        return self
+
+    def flush(self):
+        if self.pairs:
+            self.blocks.append(np.asarray(self.pairs, dtype=np.int64).reshape(-1, 4))
+            self.pairs = []
+        if self.blocks:
+            self.send(("pairs", np.concatenate(self.blocks)))
+            self.blocks = []
+            self.n_pairs = 0
+
+
+class PendingPairs(object):
+    """
+    The ortholog counts of one tree, added to a NOrthoSp once the whole tree has
+    been analysed (add_to). Held as a list of (iL, iR, nL, nR), folded into a
+    NOrthoSp of their own past max_pairs: a list for a large tree would grow
+    with its number of species pairs (hundreds of millions for a tree of tens
+    of thousands of genes).
+    """
+
+    # Fewer pairs than this are added one by one (numpy's overhead per call is larger)
+    VECTOR_MIN = 64
+
+    def __init__(self, n_sp, max_pairs=250000):
+        self.n_sp = n_sp
+        self.max_pairs = max_pairs
+        self.pairs = []
+        self.dense = None
+
+    def add_pair(self, i_l, i_r, n_l, n_r):
+        self.pairs.append((i_l, i_r, n_l, n_r))
+        if len(self.pairs) >= self.max_pairs:
+            if self.dense is None:
+                self.dense = NOrthoSp(self.n_sp)
+            self.dense.add_pairs(self.pairs)
+            self.pairs = []
+
+    def add_polytomy(self, *counts):
+        """NOrthoSp.add_polytomy, to the dense counts."""
+        if self.dense is None:
+            self.dense = NOrthoSp(self.n_sp)
+        self.dense.add_polytomy(*counts)
+
+    def add_to(self, n_ortho):
+        if self.dense is not None:
+            n_ortho += self.dense
+        if len(self.pairs) >= self.VECTOR_MIN:
+            n_ortho.add_pairs(self.pairs)
+        else:
+            for counts in self.pairs:
+                n_ortho.add_pair(*counts)

@@ -160,12 +160,13 @@ def _bit_score_matrix(I, J, S, n_seqs_i, n_seqs_j, q_check_for_self_hits, i_spec
         print("ERROR: " + text)
         raise ValueError(text)
 
-    # Keep the highest score for each (query, hit) pair: sort by pair, then
-    # score, and take the last entry of each pair.
+    # Keep the highest score for each (query, hit) pair: sort by pair and take
+    # each pair's maximum (the same value as sorting by score too, faster).
     key = I * n_seqs_j + J
-    order = np.lexsort((S, key))
+    order = np.argsort(key)     # (any order of a pair's hits: its maximum is the same)
     key = key[order]
-    last = np.ones(key.size, dtype=bool)
-    last[:-1] = key[1:] != key[:-1]
-    key = key[last]
-    return result(key // n_seqs_j, key % n_seqs_j, S[order][last])
+    first = np.ones(key.size, dtype=bool)
+    first[1:] = key[1:] != key[:-1]
+    starts = np.flatnonzero(first)
+    key = key[starts]
+    return result(key // n_seqs_j, key % n_seqs_j, np.maximum.reduceat(S[order], starts))

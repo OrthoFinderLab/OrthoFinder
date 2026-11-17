@@ -2,6 +2,7 @@
 
 import glob
 import gzip
+import heapq
 import io
 import os
 import pickle
@@ -9,7 +10,7 @@ import tempfile
 import time
 import traceback
 
-from ..utils import file_handler, file_io, paths, util
+from ..utils import file_handler, file_io, paths, system_info, util
 from ..utils.util import csv_read_mode, csv_write_mode
 
 
@@ -19,6 +20,9 @@ GZIP_BUFFER_BYTES = 256 * 1024 * 1024
 GZIP_MEMBER_BYTES = 1024 * 1024
 # The same for the other output files (TextBuffers), appended to in pieces of this size
 TEXT_BUFFER_BYTES = 256 * 1024 * 1024
+# ... or this fraction of the memory the run can use, if more (system_info.memory_budget). Not
+# the gzip files': where their members end, so their bytes, depends on it (not their text).
+TEXT_BUFFER_FRACTION = 1 / 64
 TEXT_MEMBER_BYTES = 1024 * 1024
 
 
@@ -117,6 +121,97 @@ def sorted_lines(text):
     return "\n".join(lines) + "\n"
 
 
+# The bytes read from each sorted run at a time while they are merged (SortedRuns)
+RUN_READ_BYTES = 256 * 1024
+# The merged text written to an output file at a time (SortedRuns.merge)
+MERGED_WRITE_BYTES = 1024 * 1024
+# The runs of a file up to this size are merged in memory, by one sort (Timsort
+# merges the sorted runs it finds in C, far faster than heapq.merge line by line);
+# only those of a larger file are merged from disk
+# (fixed: one write or several, so where the gzip files' members end, depends on it)
+MERGE_IN_MEMORY_BYTES = 64 * 1024 * 1024
+
+
+class SortedRuns(object):
+    """
+    The rows of the orthogroups whose rows are sent in sorted chunks (a large
+    tree: tree_analyser.get_lines_for_ortholog_files, flush), held on disk in
+    a temporary file until the orthogroup is committed. Then the chunks of each
+    output file are merged (merge): its rows sorted, as sorted_lines sorts those
+    of an orthogroup sent whole: by one sort if they have at most
+    MERGE_IN_MEMORY_BYTES, otherwise from disk with RUN_READ_BYTES of each
+    chunk in memory.
+    """
+
+    def __init__(self, spill_dir=None):
+        self.spill_dir = spill_dir
+        self.file = None
+        self.runs = {}    # iog -> {key: [(offset, length)]}
+
+    def add(self, iog, key, text):
+        if self.file is None:
+            self.file = tempfile.TemporaryFile(prefix="orthofinder_runs_", dir=self.spill_dir)
+        data = text.encode(file_io.ENCODING)
+        self.file.seek(0, os.SEEK_END)
+        offset = self.file.tell()
+        self.file.write(data)
+        self.runs.setdefault(iog, {}).setdefault(key, []).append((offset, len(data)))
+
+    def keys(self, iog):
+        return sorted(self.runs.get(iog, {}))
+
+    def _lines(self, offset, length):
+        """The lines of one run, without their newlines."""
+        end = offset + length
+        rest = b""
+        while offset < end:
+            self.file.seek(offset)
+            data = self.file.read(min(RUN_READ_BYTES, end - offset))
+            offset += len(data)
+            lines = (rest + data).split(b"\n")
+            rest = lines.pop()
+            for line in lines:
+                yield line
+        if rest:
+            yield rest
+
+    def merge(self, iog, key, write):
+        """write(text) the rows of the runs of iog and key, sorted (UTF-8 bytes sort as str)."""
+        runs = self.runs[iog][key]
+        if sum(n for _, n in runs) <= MERGE_IN_MEMORY_BYTES:
+            lines = []
+            for offset, length in runs:
+                self.file.seek(offset)
+                lines.extend(self.file.read(length).split(b"\n")[:-1])
+            lines.sort()
+            write(b"\n".join(lines).decode(file_io.ENCODING) + "\n")
+            return
+        parts = []
+        size = 0
+        for line in heapq.merge(*[self._lines(o, n) for o, n in runs]):
+            parts.append(line)
+            size += len(line) + 1
+            if size >= MERGED_WRITE_BYTES:
+                write(b"\n".join(parts).decode(file_io.ENCODING) + "\n")
+                parts = []
+                size = 0
+        if parts:
+            write(b"\n".join(parts).decode(file_io.ENCODING) + "\n")
+
+    def discard(self, iog):
+        self.runs.pop(iog, None)
+        if not self.runs and self.file is not None:
+            # nothing pending: the space can be reused
+            self.file.seek(0)
+            self.file.truncate()
+
+    def close(self):
+        self.runs = {}
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+
+
 class LazyFileCache(object):
     """
     The output files of a writer process: their text is buffered and appended in
@@ -133,7 +228,7 @@ class LazyFileCache(object):
 
     def set_budget(self, share):
         """This process's share (0-1) of the memory for the buffered text."""
-        self.text.budget = int(TEXT_BUFFER_BYTES * share)
+        self.text.budget = int(system_info.memory_budget(TEXT_BUFFER_BYTES, TEXT_BUFFER_FRACTION) * share)
         self.gz.budget = int(GZIP_BUFFER_BYTES * share)
 
     def start_gz(self, path):
@@ -209,6 +304,9 @@ class ParentOutputWriter(object):
         self.need_ortholog_output = not write_hog_tree
 
         self.cache = LazyFileCache()
+        # the rows of the large trees, in sorted chunks (add_chunk); in the
+        # working directory (set by the caller), not /tmp, which may be small
+        self.runs = SortedRuns()
 
         self.last_ortholog_lines = last_ortholog_lines
         self.suspect_genes = {}   # i_species -> misplaced gene names, written by write_last
@@ -350,6 +448,28 @@ class ParentOutputWriter(object):
                 outfile.write(sorted_lines("\n".join(names) + "\n"))
         self.suspect_genes = {}
 
+    def add_chunk(self, iog, payload):
+        """One chunk of the sorted rows of a large tree (olog_chunks, xenolog_chunks), held until write_chunked."""
+        for i, text in payload.get("olog_chunks", []):
+            self.runs.add(iog, ("o", i), text)
+        for i, text in payload.get("xenolog_chunks", []):
+            self.runs.add(iog, ("x", i), text)
+
+    def write_chunked(self, iog, chunked):
+        """
+        The rows of iog sent in chunks (add_chunk), when it is committed:
+        merged into each file if the tree was analysed (chunked True),
+        discarded if it failed (False).
+        """
+        if chunked:
+            for kind, i in self.runs.keys(iog):
+                if kind == "o":
+                    path, gz = self.ortholog_path(i), self.save_space
+                else:
+                    path, gz = self.xenolog_path(i), False
+                self.runs.merge(iog, (kind, i), lambda text: self.cache.write(path, text, gz=gz))
+        self.runs.discard(iog)
+
     def write_hog_rows(self, cached_hogs):
         if cached_hogs:
             self.hog_writer.write_cached_hogs(cached_hogs, lock_hogs=None)
@@ -365,10 +485,13 @@ class ParentOutputWriter(object):
             self.write_suspect_genes(result.get("suspect_genes", set()))
             self.write_ortholog_lines(result.get("olog_lines", []))
             self.write_xenolog_lines(result.get("olog_sus_lines", []))
+        if result.get("chunked") is not None:
+            self.write_chunked(result["iog"], result["chunked"])
 
     def close(self):
         """Write the rest of the buffered text: the files are complete."""
         try:
+            self.runs.close()
             self.cache.close_all()
         finally:
             self.hog_writer.close_files()
@@ -378,6 +501,8 @@ class ParentOutputWriter(object):
 HOG_PENDING_MEMORY_BYTES = 1024 * 1024 * 1024
 # The same for the other output (orthologs etc.), shared by its writer processes.
 NON_HOG_PENDING_MEMORY_BYTES = 1024 * 1024 * 1024
+# ... each, or this fraction of the memory the run can use, if more (system_info.memory_budget)
+PENDING_MEMORY_FRACTION = 1 / 32
 
 
 class OrderedCommitter(object):
@@ -387,8 +512,14 @@ class OrderedCommitter(object):
     in order (not for an OG without any, add_skip).
 
     Out-of-order data are kept pickled in memory up to max_pending_bytes
-    and spilled to a temporary file beyond that.
+    and spilled to temporary files beyond that, in segments of up to
+    SPILL_SEGMENT_BYTES, each deleted once all of its data have been read
+    back: the disk used is about what is pending, not all that was ever
+    spilled. They are named files, open only to write or read one OG's data
+    (writers keep no files open).
     """
+
+    SPILL_SEGMENT_BYTES = 64 * 1024 * 1024
 
     def __init__(
             self,
@@ -399,15 +530,17 @@ class OrderedCommitter(object):
         ):
         self.commit = commit
         self.iogs_ordered = list(sorted(iogs_ordered))
-        # iog -> ("mem", pickled bytes) or ("disk", offset, length)
+        # iog -> ("mem", pickled bytes) or ("disk", segment, offset, length)
         self.pending = {}
         self.next_index = 0
         if max_pending_bytes is None:
-            max_pending_bytes = HOG_PENDING_MEMORY_BYTES
+            max_pending_bytes = system_info.memory_budget(HOG_PENDING_MEMORY_BYTES, PENDING_MEMORY_FRACTION)
         self.max_pending_bytes = max_pending_bytes
         self.pending_bytes = 0
         self.spill_dir = spill_dir
-        self.spill_file = None
+        # segment -> [its file, the OGs pending in it, its size]; the last one is written to
+        self.segments = {}
+        self.n_segments = 0
 
     def add_result(self, iog, data):
         if (
@@ -433,22 +566,35 @@ class OrderedCommitter(object):
             self.pending[iog] = ("mem", data)
             self.pending_bytes += len(data)
             return
-        if self.spill_file is None:
-            self.spill_file = tempfile.TemporaryFile(
-                prefix="orthofinder_spill_", dir=self.spill_dir
-            )
-        self.spill_file.seek(0, os.SEEK_END)
-        offset = self.spill_file.tell()
-        self.spill_file.write(data)
-        self.pending[iog] = ("disk", offset, len(data))
+        current = self.n_segments - 1
+        if current not in self.segments or self.segments[current][2] >= self.SPILL_SEGMENT_BYTES:
+            fd, fn = tempfile.mkstemp(prefix="orthofinder_spill_", dir=self.spill_dir)
+            os.close(fd)
+            current = self.n_segments
+            self.n_segments += 1
+            self.segments[current] = [fn, 0, 0]
+        segment = self.segments[current]
+        with open(segment[0], "ab") as f:
+            f.write(data)
+        self.pending[iog] = ("disk", current, segment[2], len(data))
+        segment[1] += 1
+        segment[2] += len(data)
 
     def _load(self, entry):
         if entry[0] == "mem":
             self.pending_bytes -= len(entry[1])
             return pickle.loads(entry[1])
-        _, offset, length = entry
-        self.spill_file.seek(offset)
-        return pickle.loads(self.spill_file.read(length))
+        _, i_segment, offset, length = entry
+        segment = self.segments[i_segment]
+        with open(segment[0], "rb") as f:
+            f.seek(offset)
+            data = f.read(length)
+        segment[1] -= 1
+        if segment[1] == 0:
+            # (all of it read back: its disk space given back now, not at the end)
+            os.remove(segment[0])
+            del self.segments[i_segment]
+        return pickle.loads(data)
 
     def _commit(self, data):
         if data:
@@ -465,9 +611,10 @@ class OrderedCommitter(object):
             self.next_index += 1
 
     def close(self):
-        if self.spill_file is not None:
-            self.spill_file.close()
-            self.spill_file = None
+        for segment in self.segments.values():
+            if os.path.exists(segment[0]):
+                os.remove(segment[0])
+        self.segments = {}
 
     def assert_finished(self):
         name = type(self).__name__
@@ -617,7 +764,28 @@ def partition_non_hog_result(
     if duplications:
         payload_for(0)["duplications"] = duplications
 
+    chunked = result.get("chunked")
+    if chunked is not None:
+        # every writer may hold chunks of it, to merge or discard
+        for owner in range(n_writers):
+            payload_for(owner)["chunked"] = chunked
+
     return payloads
+
+
+def partition_chunk(olog_texts, sus_texts, n_writers):
+    """One chunk of a large tree's rows ({i: text}) split by the writer that owns each file."""
+    payloads = {}
+    for key, texts in (("olog_chunks", olog_texts), ("xenolog_chunks", sus_texts)):
+        for i, text in texts.items():
+            payload = payloads.setdefault(i % n_writers, {"olog_chunks": [], "xenolog_chunks": []})
+            payload[key].append((i, text))
+    return payloads
+
+
+def chunk_size(payload):
+    """The characters of a chunk's rows (partition_chunk), what it holds in memory in flight."""
+    return sum(len(text) for key in ("olog_chunks", "xenolog_chunks") for _, text in payload[key])
 
 
 def _write_non_hog_payload(output_writer, payload):
@@ -639,6 +807,9 @@ def _write_non_hog_payload(output_writer, payload):
             duplications,
         )
 
+    if payload.get("chunked") is not None:
+        output_writer.write_chunked(payload["iog"], payload["chunked"])
+
 
 # A writer's progress messages to the parent: at most one per this many seconds (the
 # parent uses them only to tell a slow writer from a stuck one)
@@ -654,20 +825,23 @@ def non_hog_writer_process(
         n_writers,
         iogs_ordered,
         spill_dir=None,
+        chunk_budget=None,
     ):
     """
     Write only files exclusively owned by this non-HOG writer (those of the
     species i with i % n_writers == writer_id, and writer 0: Duplications.tsv),
     in OG order: each worker sends every writer a result or a skip for each OG.
+    chunk_budget: the ByteBudget a chunk's size (chunk_size) is given back to, once on disk.
     """
     committer = OrderedCommitter(
         lambda payload: _write_non_hog_payload(output_writer, payload),
         iogs_ordered,
-        max_pending_bytes=NON_HOG_PENDING_MEMORY_BYTES // max(1, n_writers),
+        max_pending_bytes=system_info.memory_budget(NON_HOG_PENDING_MEMORY_BYTES, PENDING_MEMORY_FRACTION) // max(1, n_writers),
         spill_dir=spill_dir,
     )
     # the text held in memory: the writers share the budget
     output_writer.cache.set_budget(1.0 / max(1, n_writers))
+    output_writer.runs.spill_dir = spill_dir
     active_workers = n_workers
     error_text = None
     last_status = 0.0
@@ -690,6 +864,12 @@ def non_hog_writer_process(
 
             if kind == "result":
                 committer.add_result(msg[1]["iog"], msg[1])
+            elif kind == "chunk":
+                # to disk now (written when its OG is committed): a large tree's
+                # rows are never all in memory
+                output_writer.add_chunk(msg[1], msg[2])
+                if chunk_budget is not None:
+                    chunk_budget.release(chunk_size(msg[2]))
             elif kind == "skips":
                 for iog in msg[1]:
                     committer.add_skip(iog)
@@ -713,6 +893,7 @@ def non_hog_writer_process(
 
     try:
         committer.close()
+        output_writer.runs.close()
         output_writer.cache.close_all()
     except Exception:
         close_error = traceback.format_exc()

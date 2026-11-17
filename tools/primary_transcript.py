@@ -70,6 +70,7 @@ import os
 import re
 import sys
 import argparse
+import contextlib
 import tarfile
 import zipfile
 import tempfile
@@ -84,7 +85,7 @@ def is_archive(fn):
 def is_fasta_file(fn):
     return os.path.splitext(fn)[1].lower() in FASTA_EXTENSIONS
 
-def process_fasta_file(fn, dout, gene_name_function_name=None):
+def process_fasta_file(fn, outfn, gene_name_function_name=None):
     if not check_file(fn):
         return
 
@@ -103,28 +104,19 @@ def process_fasta_file(fn, dout, gene_name_function_name=None):
 
     create_primary_transcripts_file(
         fn,
-        dout,
+        outfn,
         gene_name_function_name,
         q_use_original_accession_line,
     )
 
-def process_archive(fn, dout, gene_name_function=None):
-
+def extract_archive(fn, tmpdir):
     print("\nExtracting archive: %s" % fn)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-
-        if zipfile.is_zipfile(fn):
-
-            with zipfile.ZipFile(fn, "r") as zf:
-                zf.extractall(tmpdir)
-
-        else:
-
-            with tarfile.open(fn, "r:*") as tf:
-                tf.extractall(tmpdir)
-
-        process_input(tmpdir, dout, gene_name_function)
+    if zipfile.is_zipfile(fn):
+        with zipfile.ZipFile(fn, "r") as zf:
+            zf.extractall(tmpdir)
+    else:
+        with tarfile.open(fn, "r:*") as tf:
+            tf.extractall(tmpdir)
 
 def check_file(fn):
     """
@@ -222,7 +214,7 @@ def get_gene_name_ncbi(acc_line):
         acc_line = acc_line.split(None, 1)[-1]
     return acc_line
 
-def create_primary_transcripts_file(fn, dout, gene_name_fn, q_use_original_accession_line):
+def create_primary_transcripts_file(fn, outfn, gene_name_fn, q_use_original_accession_line):
     # Get genes and lengths
     max_gene_lens = defaultdict(int)
     with open(fn, 'r', encoding="utf-8") as infile:
@@ -262,7 +254,6 @@ def create_primary_transcripts_file(fn, dout, gene_name_fn, q_use_original_acces
     # Get longest version for each gene
     # Parse file second time and only write out sequences that are longest variant
     n_genes_written = 0
-    outfn = os.path.join(dout, os.path.basename(fn))
     with open(outfn, 'w', encoding="utf-8", newline="\n") as outfile:
         i_line = -1
         while i_line < N:
@@ -301,39 +292,103 @@ def space(text):
 def last_dot_before_first_space(text):
     return text[1:].rstrip().split(None, 1)[0].rstrip().rsplit(".", 1)[0]
 
+def archive_name(fn):
+    """An archive's name without its extensions (.zip, .tar, .tar.gz, .tgz)."""
+    name = os.path.basename(fn)
+    for ext in (".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar", ".zip"):
+        if name.lower().endswith(ext):
+            return name[:-len(ext)]
+    return name
+
+
+def collect_fasta_files(path, dout, stack, parts=()):
+    """
+    [(FASTA file, the parts of its path from the input: directories, archives
+    by name, and its file name)] of path (a FASTA file, a directory or an
+    archive), searched recursively, archives extracted to temporary
+    directories kept until stack closes. Not the files of dout.
+    """
+    path = os.path.abspath(path)
+    if os.path.isdir(path):
+        found = []
+        for root, dirs, files in os.walk(path):
+            root_abs = os.path.abspath(root)
+            dirs[:] = sorted(d for d in dirs if os.path.abspath(os.path.join(root_abs, d)) != dout)
+            rel = os.path.relpath(root_abs, path)
+            rel_parts = () if rel == "." else tuple(rel.split(os.sep))
+            for filename in sorted(files):
+                found += collect_fasta_files(os.path.join(root_abs, filename), dout, stack,
+                                             parts + rel_parts)
+        return found
+    if is_archive(path):
+        tmpdir = stack.enter_context(tempfile.TemporaryDirectory())
+        extract_archive(path, tmpdir)
+        return collect_fasta_files(tmpdir, dout, stack, parts + (archive_name(path),))
+    if is_fasta_file(path) and os.path.commonpath([path, dout]) != dout:
+        # (not the files already in the output directory)
+        return [(path, parts + (os.path.basename(path),))]
+    return []
+
+
+def output_names(paths_parts):
+    """
+    The output file name of each FASTA file: its own name, or if another file
+    has that name too (e.g. each species' protein.faa in a directory of its
+    own, as NCBI downloads are), as few of its directories before it as make
+    it distinct, joined by "_" (e.g. sp1_protein.faa). The names are distinct
+    as written too: if one is another's (a/x.fa and a file a_x.fa), more of
+    its directories are added, or a number (a_x.2.fa). The path endings are
+    counted once (a dictionary), so the time grows with the files, not with
+    each pair of them.
+    """
+    endings = {}
+    for parts in paths_parts:
+        for k in range(1, len(parts) + 1):
+            endings[parts[-k:]] = endings.get(parts[-k:], 0) + 1
+    depths = []
+    for parts in paths_parts:
+        k = 1
+        while k < len(parts) and endings[parts[-k:]] > 1:
+            k += 1
+        depths.append(k)
+    names = ["_".join(parts[-k:]) for parts, k in zip(paths_parts, depths)]
+    while True:
+        by_name = {}
+        for i, name in enumerate(names):
+            by_name.setdefault(name, []).append(i)
+        clashes = [ii for ii in by_name.values() if len(ii) > 1]
+        if not clashes:
+            return names
+        changed = False
+        for ii in clashes:
+            for i in ii:
+                if depths[i] < len(paths_parts[i]):
+                    depths[i] += 1
+                    names[i] = "_".join(paths_parts[i][-depths[i]:])
+                    changed = True
+        if not changed:
+            # (every one of a clash named by its whole path already: a number for all but the first)
+            taken = set(names)
+            for ii in clashes:
+                for i in ii[1:]:
+                    root, ext = os.path.splitext(names[i])
+                    n = 2
+                    while "%s.%d%s" % (root, n, ext) in taken:
+                        n += 1
+                    names[i] = "%s.%d%s" % (root, n, ext)
+                    taken.add(names[i])
+
+
 def process_input(path, dout, gene_name_function=None):
     path = os.path.abspath(path)
     dout = os.path.abspath(dout)
+    with contextlib.ExitStack() as stack:
+        found = collect_fasta_files(path, dout, stack)
+        names = output_names([parts for _, parts in found])
+        for (fn, _), name in zip(found, names):
+            print("\nProcessing FASTA: %s" % fn)
+            process_fasta_file(fn, os.path.join(dout, name), gene_name_function)
 
-    if os.path.isdir(path):
-
-        for root, dirs, files in os.walk(path):
-            root_abs = os.path.abspath(root)
-            dirs[:] = [
-                d for d in dirs
-                if os.path.abspath(os.path.join(root_abs, d)) != dout
-            ]
-
-            for filename in sorted(files):
-                process_input(
-                    os.path.join(root_abs, filename),
-                    dout,
-                    gene_name_function,
-                )
-
-    elif is_archive(path):
-
-        process_archive(path, dout, gene_name_function)
-
-    elif is_fasta_file(path):
-
-        # Avoid re-processing files already inside the output directory.
-        if os.path.commonpath([path, dout]) == dout:
-            return
-
-        print("\nProcessing FASTA: %s" % path)
-        process_fasta_file(path, dout, gene_name_function)
-        process_fasta_file(path, dout, gene_name_function)
 
 def main(args=None):
 

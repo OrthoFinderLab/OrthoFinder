@@ -19,8 +19,9 @@ from .. import __location__
 
 # The separators of the commands in a command line (kept by split)
 _SEPARATORS = re.compile(r"(\n|;|&&|\|\||\|)")
-# The start of a command: spaces, VAR=value assignments, then the program
-_COMMAND_START = re.compile(r"(\s*)((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)(\S+)")
+# The start of a command: spaces (and the "{" of a group, e.g. trim.TrimProgram.shell_command's),
+# VAR=value assignments, then the program
+_COMMAND_START = re.compile(r"(\s*(?:\{\s+)*)((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)(\S+)")
 
 # Shell builtins and keywords: never replaced by a program found on PATH
 SHELL_WORDS = {

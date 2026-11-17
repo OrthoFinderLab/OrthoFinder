@@ -160,6 +160,14 @@ def start_run(ctx, args, input_args):
         file_handler.handler.log_fail_and_exit(
             "ERROR: The '--assign' run in %s stopped before its new species were added, so it "
             "cannot be continued with -b. Run --assign again." % results_dir)
+    # (with the settings restored, e.g. -d of the run being continued; before they are saved
+    # for a restart, and before the trimming program is tested). Only if this run makes
+    # alignments: a restart from the trees (-ft, -fgt) runs with a trimming program
+    # restored that is no longer configured.
+    if assign_resume or check_dependencies.runs_gene_trees(options):
+        process_args.check_trimming(options, prog_caller)
+    # (also for a restart from the trees, whose dropped columns are of the run's trimming)
+    options.trim_gaps = process_args.trim_gaps(options, prog_caller)
     run_state.record_run(results_dir, "assign" if options.q_fast_add else "core",
                          " ".join(["orthofinder"] + input_args))
     run_state.save_settings(results_dir, options)

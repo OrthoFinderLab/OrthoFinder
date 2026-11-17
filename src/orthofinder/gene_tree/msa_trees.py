@@ -497,8 +497,51 @@ def write_test_file(d):
     # nOrtho = list(map(float, nOrtho))
     # return fractions, nOrtho
     
-def trim_fn(fn, msa_min_seq):
-    trim.main(fn, fn, msa_min_seq, 0.1, 500, 0.75, False)
+def trim_commands(trimmer, iog, aln_fn, msa_min_seq, n_seqs):
+    """
+    The steps that trim an orthogroup's alignment of n_seqs sequences, for its
+    list of commands: a trimming program's command (run as the MSA and tree
+    commands are, if it trims an alignment of that many), then trim.trim_msa.
+    """
+    dropped_fn = file_handler.handler.get_align_dropped_fn(iog) if trimmer.keep_dropped else None
+    steps = []
+    q_program = trimmer.program is not None and n_seqs > msa_min_seq     # (decided here only)
+    if q_program:
+        steps.append((trimmer.program.shell_command(aln_fn, aln_fn, trimmer.keep_dropped, n_seqs), None))
+    steps.append((trim.trim_msa, (trimmer, aln_fn, msa_min_seq, dropped_fn, q_program)))
+    return steps
+
+
+# The trimming of a run's alignments, in checkpoint.txt only: a summary line, and a line for
+# each alignment of REPORT_MIN_SEQS sequences or more that the trimming program could not
+# trim (it failed, removed every column or left a sequence with no residues: kept untrimmed).
+# Those trimmed without the columns removed written (--keep-dropped): a line each in
+# checkpoint.txt and a summary to the screen and Log.txt.
+TRIMMING_STAGE = "Build alignments and gene trees"
+REPORT_MIN_SEQS = 1000
+
+
+def write_trimming_warnings(records, program_name, msa_min_seq=10):
+    """records: (alignment file name, what happened, the number of sequences, a note or None, a warning or None), from trim.trim_msa."""
+    if not records:
+        return
+    records = sorted(records, key=lambda r: r[0])
+    counts = collections.Counter(r[1] for r in records)
+    printing.report_notes(TRIMMING_STAGE, ["%s %s" % (aln_fn, note) for aln_fn, status, n_seqs, note, _ in records
+                                           if note and status == trim.UNTRIMMED and n_seqs >= REPORT_MIN_SEQS])
+    printing.report_notes(TRIMMING_STAGE, [
+        "Trimming with %s, %d alignments: %d trimmed, %d with every column kept, %d kept untrimmed (the trimming "
+        "program failed, removed every column or left a sequence with no residues), %d not trimmed (%d sequences "
+        "or fewer)" % (program_name, len(records), counts[trim.TRIMMED], counts[trim.ALL_KEPT], counts[trim.UNTRIMMED],
+                       counts[trim.FEW], msa_min_seq)])
+    lines = ["%s trimmed, %s" % (aln_fn, warning) for aln_fn, _, _, _, warning in records if warning]
+    if lines:
+        printing.report_warnings(TRIMMING_STAGE, lines,
+                                 "%d %s trimmed by %s without the columns removed written (--keep-dropped). "
+                                 "Details in %s" % (len(lines), "alignment was" if len(lines) == 1 else
+                                                    "alignments were", program_name,
+                                                    file_handler.handler.get_check_point_fn()))
+
 
 """ 
 -----------------------------------------------------------------------------
@@ -635,7 +678,7 @@ class TreesForOrthogroups(object):
             q_stop_after_seqs, 
             q_stop_after_alignments, 
             q_do_species_tree, 
-            q_trim, 
+            trimmer,
             i_og_restart=0, 
             cmd_order="descending",
             method_threads=None,
@@ -649,6 +692,7 @@ class TreesForOrthogroups(object):
             program (-ST), instead of from the concatenated alignment
         species_tree_alignment: with species_tree_program, also write the
             concatenated alignment (it is always written without it)
+        trimmer: how the MSAs are trimmed (a trim.Trimmer), None not at all
         """
         q_from_gene_trees = species_tree_program is not None
 
@@ -713,7 +757,6 @@ class TreesForOrthogroups(object):
                 tasksize=aln_tasksize,
                 method_threads=method_threads,
                 cmd_order=cmd_order,
-                q_trim=q_trim,
                 q_print_on_error=print_on_error,
             )
             if q_do_species_tree:
@@ -760,11 +803,17 @@ class TreesForOrthogroups(object):
         iog_to_tree = dict(zip(orig_iogs_tree, orig_tree_commands_and_filenames))
         iog_to_alignment_fn = dict(zip(iogs_align, alignment_files_to_use))
 
+        if trimmer is not None and trimmer.keep_dropped:
+            os.makedirs(file_handler.handler.get_align_dropped_id_dir(), exist_ok=True)
+        warnings = []
+        # (of a stopped run, whatever its trimming: also if this one has no trimming program)
+        trim.remove_temp_files(os.path.dirname(self.get_alignment_filename(0)))
+
         def commands_for_og(iog):
             commands = [iog_to_align[iog]]
             if iog in iog_to_tree:
-                if q_trim:
-                    commands.append((trim_fn, (iog_to_alignment_fn[iog], msa_min_seq)))
+                if trimmer is not None:
+                    commands.extend(trim_commands(trimmer, iog, iog_to_alignment_fn[iog], msa_min_seq, len(ogs[iog])))
                 commands.append(iog_to_tree[iog])
             return commands
 
@@ -824,16 +873,21 @@ class TreesForOrthogroups(object):
                 commands_and_filenames = species_tree_commands() + commands_and_filenames
         else:
             printing.print_underline("Inferring multiple sequence alignments and gene trees")
-        command_runner.run_parallel_commands_and_move_results_file(n_processes, 
-                                                 commands_and_filenames, 
-                                                 True, 
-                                                 method_threads=method_threads,
-                                                 cmd_order=cmd_order,
-                                                 q_trim=q_trim,
-                                                 q_print_on_error=print_on_error,
-                                                 follow_up=follow_up,
-                                                 progress=progress,
-                                                 )
+        try:
+            command_runner.run_parallel_commands_and_move_results_file(n_processes,
+                                                     commands_and_filenames,
+                                                     True,
+                                                     method_threads=method_threads,
+                                                     cmd_order=cmd_order,
+                                                     q_print_on_error=print_on_error,
+                                                     follow_up=follow_up,
+                                                     progress=progress,
+                                                     on_function_result=warnings.append,
+                                                     )
+        finally:
+            # (also if the run stops: those of the alignments done, to see why)
+            if trimmer is not None:
+                write_trimming_warnings(list(warnings), trimmer.name(), msa_min_seq)
         
         # # Convert ids to accessions for MSA
         # accessionAlignmentFNs = [self.get_alignment_filename(i, True) for i in iogs_align]

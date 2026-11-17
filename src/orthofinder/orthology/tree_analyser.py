@@ -14,12 +14,15 @@ import sys
 import itertools
 from collections import defaultdict 
 
+import numpy as np
+
 
 try:
     from rich import print
 except ImportError:
     ...
 from ..utils import file_handler, file_io, parallel_task_manager
+from ..utils import printing
 from ..phylo import taxa as phylo_taxa
 from . import stats
 from .rooting import check_and_root_tree
@@ -92,21 +95,37 @@ class TreeAnalyser(object):
         self.exist_msa = exist_msa
         self.write_hog_tree = write_hog_tree
         self.other_names = other_names
+        # The polytomies of the trees analysed (polytomy_record), in the pass that
+        # writes the orthologs (not write_hog_tree): this process's, those of the
+        # parallel workers added by the parent (write_polytomies)
+        self.polytomies = []
 
 
-    def analyse_tree(self, iog, n_ortho_acc=None):
+    def analyse_tree(self, iog, n_ortho_acc=None, emit_chunk=None):
         """
         Analyse one gene tree.
 
         It returns a payload to the parent process.
 
-        If nOrtho_acc (a stats.NOrthoSp) is given, this tree's ortholog
-        counts are added to it once the whole tree has been analysed, and the
-        payload's "n_orthologs" is None. Otherwise it holds a dense
-        NOrthoSp for this tree.
+        If nOrtho_acc (a stats.NOrthoSp or StreamedCounts) is given, this
+        tree's ortholog counts are added to it once the whole tree has been
+        analysed, and the payload's "n_orthologs" is None. Otherwise it holds a
+        dense NOrthoSp for this tree, but in the HOG pass (write_hog_tree),
+        whose counts are not used, None.
+
+        emit_chunk(iog, olog_texts, sus_texts) (with n_ortho_acc): the rows of a
+        large tree are sent to it in sorted chunks as they are made
+        (get_lines_for_ortholog_files: flush), not in the payload. The
+        payload's "chunked" is then True, or False if the tree failed after
+        chunks were sent (they are to be discarded); None if none were.
         """
         og_name = "OG%07d" % iog
         n_species = len(self.species_to_use)
+        chunks_sent = [False]
+
+        def flush(olog_texts, sus_texts):
+            chunks_sent[0] = True
+            emit_chunk(iog, olog_texts, sus_texts)
 
         try:
             if self.write_hog_tree:
@@ -126,6 +145,8 @@ class TreeAnalyser(object):
             if rooted_tree_ids is None:
                 return None
 
+            polytomies = None if self.write_hog_tree else []
+
             orthologs, recon_tree, suspect_genes, dups = get_orthologs_from_tree(
                 iog,
                 rooted_tree_ids,
@@ -133,24 +154,33 @@ class TreeAnalyser(object):
                 self.GeneToSpecies,
                 self.neighbours,
                 q_get_dups=True,
-                q_no_recon=self.q_no_recon
+                q_no_recon=self.q_no_recon,
+                polytomies=polytomies,
+                q_orthologs=not self.write_hog_tree,     # (the HOG pass: not used)
             )
 
             ortholog_lines = empty_ortholog_lines(self.nspecies)
             ortholog_sus_lines = ["" for _ in range(self.nspecies)]
 
-            pair_counts = [] if n_ortho_acc is not None else None
-            n_orthologs_sp_pair = get_lines_for_ortholog_files(
-                [(iog, orthologs)],
-                self.species_dict,
-                self.species_to_use,
-                self.sequence_dict,
-                len(suspect_genes) > 0,
-                ortholog_lines,
-                ortholog_sus_lines,
-                pair_counts=pair_counts,
-                other_names=self.other_names,
-            )
+            pair_counts = stats.PendingPairs(n_species) if n_ortho_acc is not None else None
+            q_flush = emit_chunk is not None and n_ortho_acc is not None
+            if self.write_hog_tree:
+                # (the HOG pass: its ortholog rows and counts are not used, those of the second pass are)
+                n_orthologs_sp_pair = None
+            else:
+                n_orthologs_sp_pair = get_lines_for_ortholog_files(
+                    [(iog, orthologs)],
+                    self.species_dict,
+                    self.species_to_use,
+                    self.sequence_dict,
+                    len(suspect_genes) > 0,
+                    ortholog_lines,
+                    ortholog_sus_lines,
+                    pair_counts=pair_counts,
+                    other_names=self.other_names,
+                    flush=flush if q_flush else None,
+                )
+            del orthologs
 
             cached_hogs = get_hogs_from_tree(
                 iog,
@@ -162,9 +192,10 @@ class TreeAnalyser(object):
             self.write_resolved_tree(recon_tree, iog)
 
             if n_ortho_acc is not None:
-                # Only count trees that were analysed completely.
-                for counts in pair_counts:
-                    n_ortho_acc.add_pair(*counts)
+                # Only count trees that were analysed completely (the last step that can fail is above).
+                pair_counts.add_to(n_ortho_acc)
+            if polytomies:
+                self.polytomies.extend(polytomies)
 
             return {
                 "iog": iog,
@@ -174,6 +205,7 @@ class TreeAnalyser(object):
                 "duplications": dups,
                 "suspect_genes": suspect_genes,
                 "cached_hogs": cached_hogs,
+                "chunked": True if chunks_sent[0] else None,
             }
 
         except parallel_task_manager.WorkerError:
@@ -185,13 +217,14 @@ class TreeAnalyser(object):
             return {
                 "iog": iog,
                 "n_orthologs": (
-                    stats.NOrthoSp(n_species) if n_ortho_acc is None else None
+                    stats.NOrthoSp(n_species) if n_ortho_acc is None and not self.write_hog_tree else None
                 ),
                 "olog_lines": empty_ortholog_lines(self.nspecies),
                 "olog_sus_lines": ["" for _ in range(self.nspecies)],
                 "duplications": [],
                 "suspect_genes": set(),
                 "cached_hogs": [],
+                "chunked": False if chunks_sent[0] else None,
             }
 
     def write_resolved_tree(self, recon_tree, iog):
@@ -214,6 +247,22 @@ class TreeAnalyser(object):
         except Exception as e:
             raise parallel_task_manager.WorkerError(
                 "ERROR: Cannot write the resolved gene tree of OG%07d, %s (%s: %s)" % (iog, fn, type(e).__name__, e))
+
+
+# The ortholog and xenologue rows of a tree a worker holds before it sends them
+# on as sorted chunks (get_lines_for_ortholog_files: flush). Most trees have
+# fewer, and are sent whole. Fixed (not system_info.memory_budget): whether a tree is
+# sent in chunks decides how its rows are written, so where the gzip files' members end.
+CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def sorted_rows(rows):
+    """
+    The rows (each ending in a newline) sorted, as one text: as sorted_lines
+    (ortholog_writers), which sorts the lines without their newlines ("a\tb"
+    sorts after "a", "a\tb\n" before "a\n").
+    """
+    return "\n".join(sorted(row[:-1] for row in rows)) + "\n"
 
 
 def empty_ortholog_lines(nspecies):
@@ -286,8 +335,18 @@ def get_orthologs_from_tree(
         neighbours,
         q_get_dups=False,
         q_no_recon=False,
+        polytomies=None,
+        q_orthologs=True,
     ):
-    """Infer orthologs and duplications from a reconciled gene tree."""
+    """
+    Infer orthologs and duplications from a reconciled gene tree.
+
+    q_orthologs: also the orthologs (not for the HOG pass, which does not use
+    them: the tree's features, suspect genes and duplications only)
+
+    polytomies: a list, to which a record is added for each polytomy
+    (polytomy_record)
+    """
     og_name = "OG%07d" % iog
     q_prune = False
 
@@ -391,20 +450,20 @@ def get_orthologs_from_tree(
             else:
                 n.add_feature("dup_type", "speciation")
 
-                orthologs.append(
-                    orthologs_and_suspect(
-                        ch,
-                        suspect_genes,
-                        misplaced_genes,
-                        species_and_gene
+                if q_orthologs:
+                    orthologs.append(
+                        orthologs_and_suspect(
+                            ch,
+                            suspect_genes,
+                            misplaced_genes,
+                            species_and_gene
+                        )
                     )
-                )
 
                 suspect_genes.update(misplaced_genes)
 
         elif len(ch) > 2:
-            species = [sp_sets.species(child) for child in ch]
-            all_species = set.union(*species)
+            all_species = sp_sets.species(n)
             st_node = species_tree_mrca(sp_sets.mask(n), all_species)
             n.add_feature("sp_node", st_node.name)
 
@@ -412,28 +471,26 @@ def get_orthologs_from_tree(
                 genes = n.get_leaf_names()
                 duplications.append((st_node.name, n.name, 1.0, genes, []))
                 n.add_feature("dup", True)
+                if polytomies is not None:
+                    polytomies.append(polytomy_record(og_name, n, 1, "single species", 0, species_and_gene))
             else:
-                dups = []
-                for (n0, s0), (n1, s1) in itertools.combinations(
-                        zip(ch, species), 2):
-                    if len(s0.intersection(s1)) == 0:
-                        orthologs.append(
-                            orthologs_and_suspect(
-                                (n0, n1),
-                                suspect_genes,
-                                empty_set,
-                                species_and_gene
-                            )
-                        )
-                        dups.append(False)
-                    else:
-                        dups.append(True)
-
-                if all(dups):
-                    genes = n.get_leaf_names()
-                    duplications.append((st_node.name, n.name, 1.0, genes, []))
-
-                n.add_feature("dup", all(dups))
+                # The children grouped by their species (polytomy_orthologs): an
+                # entry per pair of children would be one ortholog relationship
+                # per pair, a billion for a polytomy of ~50,000 identical
+                # sequences (FastTree joins them as one node)
+                masks = [sp_sets.mask(child) for child in ch]
+                q_dup = children_all_share_species(masks)
+                entry = None
+                if q_orthologs:
+                    entry = polytomy_orthologs(ch, masks, suspect_genes, species_and_gene)
+                    orthologs.append(entry)
+                if q_dup:
+                    duplications.append((st_node.name, n.name, 1.0, n.get_leaf_names(), []))
+                n.add_feature("dup", q_dup)
+                if polytomies is not None and entry is not None:
+                    polytomies.append(polytomy_record(og_name, n, len(entry.groups),
+                                                      "duplication" if q_dup else "speciation",
+                                                      entry.n_ortholog_pairs(), species_and_gene))
 
     return orthologs, tree, suspect_genes, duplications
 
@@ -521,6 +578,257 @@ def resolve_overlap(overlap, sp0, sp1, ch, tree, neighbours, GeneToSpecies, rel_
     else:
         return False, set()
           
+# The polytomies of the gene trees, a row each, next to Resolved_Gene_Trees.txt
+# (write_polytomies), and their stage in checkpoint.txt
+POLYTOMIES_FN = "Polytomies.tsv"
+POLYTOMY_STAGE = "Infer orthologs"
+POLYTOMIES_HEADER = ("Orthogroup", "Node", "Children", "Genes", "Species", "Max Genes of a Species",
+                     "Species Sets of Children", "Event", "Ortholog Pairs")
+
+
+def polytomy_record(og_name, node, n_species_sets, event, n_pairs, species_and_gene):
+    """The row of Polytomies.tsv of a polytomy, node (POLYTOMIES_HEADER)."""
+    per_species = defaultdict(int)
+    for gene in node.get_leaf_names():
+        per_species[species_and_gene(gene)[0]] += 1
+    return (og_name, node.name, len(node.get_children()), sum(per_species.values()), len(per_species),
+            max(per_species.values()), n_species_sets, event, n_pairs)
+
+
+class MergedGenes(list):
+    """The genes of a species in several groups of a polytomy, merged for one grouped entry."""
+
+
+class DisjointGroups:
+    """
+    Whether each pair of groups of a polytomy's children has no species in
+    common, a row (group) at a time or in blocks of rows, without a groups x
+    groups matrix of floats (which for tens of thousands of groups would not
+    fit in memory). If every group is of one species (the usual large
+    polytomy, of identical sequences), every pair of groups is (their species
+    sets differ): nothing is held. Otherwise from their species sets as bits
+    (words: groups x 64-bit words), held as a bool matrix if it is at most
+    BLOCK_BYTES, else made a block of rows at a time when needed.
+    """
+    BLOCK_BYTES = 64 * 1024 ** 2      # (of a block of rows being made, or used)
+
+    def __init__(self, group_masks):
+        self.k = len(group_masks)
+        self.words = None
+        self.matrix = None
+        if not all(m & (m - 1) == 0 for m in group_masks):
+            n_words = max(m.bit_length() for m in group_masks) // 64 + 1
+            self.words = np.array([[(m >> (64 * w)) & 0xFFFFFFFFFFFFFFFF for w in range(n_words)]
+                                   for m in group_masks], dtype=np.uint64)
+            if self.k * self.k <= self.BLOCK_BYTES:
+                self.matrix = np.empty((self.k, self.k), dtype=bool)
+                for start, stop in self._ranges(8):
+                    self.matrix[start:stop] = self._make_rows(start, stop)
+
+    def _ranges(self, bytes_per_cell):
+        step = max(1, self.BLOCK_BYTES // max(self.k * bytes_per_cell, 1))
+        for start in range(0, self.k, step):
+            yield start, min(self.k, start + step)
+
+    def _make_rows(self, start, stop):
+        shared = np.zeros((stop - start, self.k), dtype=bool)
+        for w in range(self.words.shape[1]):        # (a word at a time: no rows x groups x words)
+            shared |= (self.words[start:stop, w, None] & self.words[None, :, w]) != 0
+        return ~shared
+
+    def rows(self, start, stop):
+        """Those of the groups start to stop (rows) with every group (columns), as bool."""
+        if self.words is None:
+            block = np.ones((stop - start, self.k), dtype=bool)
+            block[np.arange(stop - start), np.arange(start, stop)] = False
+            return block
+        if self.matrix is not None:
+            return self.matrix[start:stop]
+        return self._make_rows(start, stop)
+
+    def later(self, a):
+        """The groups after a with no species in common with it."""
+        if self.words is None:
+            return range(a + 1, self.k)
+        return [int(b) for b in np.flatnonzero(self.rows(a, a + 1)[0, a + 1:]) + a + 1]
+
+    def dot(self, x):
+        """The matrix of whether the groups are disjoint (0/1) times x (groups x n), as float64."""
+        if self.words is None:
+            return x.sum(axis=0) - x            # (ones but the diagonal)
+        out = np.empty_like(x, dtype=np.float64)
+        for start, stop in self._ranges(8):
+            out[start:stop] = self.rows(start, stop).astype(np.float64) @ x
+        return out
+
+
+class PolytomyOrthologs:
+    """
+    The orthologs of a polytomy (see polytomy_orthologs), in place of an
+    (o_0, o_1, os_0, os_1) per pair of its children, which would be held
+    together: a billion for a polytomy of ~50,000 identical sequences.
+
+    children: the (o, os) of each child, as orthologs_and_suspect's
+    groups: the children of each species set (indices)
+    disjoint: the pairs of groups with no species in common (DisjointGroups)
+    counts: the arguments of NOrthoSp.add_polytomy (species instead of
+    indices), the relationships of every pair of children
+    """
+
+    def __init__(self, children, groups, disjoint, counts):
+        self.children = children
+        self.groups = groups
+        self.disjoint = disjoint
+        self.counts = counts
+
+    def n_ortholog_pairs(self):
+        """The pairs of genes written as orthologs (not suspect), of every pair of children with no species in common."""
+        n = np.array([[sum(len(genes) for i in group for genes in self.children[i][0].values())]
+                      for group in self.groups], dtype=np.float64)
+        return int(round(float((n * self.disjoint.dot(n)).sum()) / 2))
+
+    def grouped_entries(self):
+        """
+        (o_0, o_1, os_0, os_1) of the genes of each group against those of
+        all the later groups with none of its species: the relationships of
+        every pair of children, in rows per pair of species (rather than per
+        pair of children), so their number does not grow with the children:
+        for the usual polytomy of identical sequences of one species each, at
+        most that of the pairs of species. A species' list is shared, not
+        copied, if it is of one group.
+        """
+        sides = []
+        for group in self.groups:
+            sides.append([defaultdict(list), defaultdict(list)])
+            for i in group:
+                for side, genes in zip(sides[-1], self.children[i]):
+                    for sp, seqs in genes.items():
+                        side[sp].extend(seqs)
+        for a in range(len(self.groups)):
+            later = self.disjoint.later(a)
+            if len(later) == 0:
+                continue
+            right = []
+            for i_side in range(2):
+                parts = defaultdict(list)
+                for b in later:
+                    for sp, genes in sides[b][i_side].items():
+                        parts[sp].append(genes)
+                right.append({sp: p[0] if len(p) == 1 else MergedGenes(itertools.chain.from_iterable(p))
+                              for sp, p in parts.items()})
+            yield sides[a][0], right[0], sides[a][1], right[1]
+
+
+def polytomy_orthologs(ch, masks, suspect_genes, species_and_gene):
+    """
+    The orthologs of a polytomy of several species, its children ch, of
+    species masks (SpeciesSets). The children are grouped by
+    their species: the children of a group have the same species, so they are
+    never orthologs of each other, and every child of a group is an ortholog
+    of every child of a group with no species in common.
+
+    Returns the PolytomyOrthologs, for any number of groups (the relationships
+    of every pair of children, as of a smaller polytomy).
+    """
+    children = []
+    for child in ch:
+        normal, suspect = defaultdict(list), defaultdict(list)
+        for gene in child.get_leaf_names():
+            sp, seq = species_and_gene(gene)
+            (suspect if gene in suspect_genes else normal)[sp].append(seq)
+        children.append((normal, suspect))
+    return polytomy_from_children(children, masks)
+
+
+def polytomy_from_children(children, masks):
+    """The PolytomyOrthologs of a polytomy's children ((o, os) of each) of species masks."""
+    group_of = {}
+    for m in masks:
+        if m not in group_of:
+            group_of[m] = len(group_of)
+    k = len(group_of)
+
+    groups = [[] for _ in range(k)]
+    species, col = [], {}
+    child_genes = []            # (group, species column, normal genes) of each child and species
+    for i, ((normal, _), m) in enumerate(zip(children, masks)):
+        g = group_of[m]
+        groups[g].append(i)
+        for sp, genes in normal.items():
+            if sp not in col:
+                col[sp] = len(species)
+                species.append(sp)
+            child_genes.append((g, col[sp], len(genes)))
+
+    group_masks = list(group_of)
+    disjoint = DisjointGroups(group_masks)
+
+    c1, cm, sm = (np.zeros((k, len(species))) for _ in range(3))
+    if child_genes:
+        a = np.array(child_genes, dtype=np.int64)
+        one = a[:, 2] == 1
+        np.add.at(c1, (a[one, 0], a[one, 1]), 1)
+        np.add.at(cm, (a[~one, 0], a[~one, 1]), 1)
+        np.add.at(sm, (a[~one, 0], a[~one, 1]), a[~one, 2])
+    return PolytomyOrthologs(children, groups, disjoint, (species, disjoint, c1, cm, sm))
+
+
+def write_polytomies(records, d_out):
+    """
+    The polytomies of the gene trees (records of every tree, polytomy_record)
+    to d_out + POLYTOMIES_FN, a row each, sorted by orthogroup and node, and
+    a summary line in checkpoint.txt. No polytomies, no file (and none of an
+    earlier run of the same results directory, as a restart from the trees).
+    """
+    fn = os.path.join(d_out, POLYTOMIES_FN)
+    if not records:
+        if os.path.exists(fn):
+            os.remove(fn)
+        return
+    records = sorted(records, key=lambda r: (r[0], node_order(r[1])))
+    with open(fn, "w", encoding="utf-8", newline="\n") as outfile:
+        outfile.write("\t".join(POLYTOMIES_HEADER) + "\n")
+        for record in records:
+            outfile.write("\t".join(map(str, record)) + "\n")
+    printing.report_notes(POLYTOMY_STAGE, [polytomies_summary(records, fn)])
+
+
+def node_order(name):
+    """A gene tree node's name (n<i>) as its number, to sort n2 before n10."""
+    return (0, int(name[1:]), name) if name[:1] == "n" and name[1:].isdigit() else (1, 0, name)
+
+
+def polytomies_summary(records, fn):
+    """The line of checkpoint.txt of the polytomies (records, of POLYTOMIES_HEADER) written to fn."""
+    n_ogs = len({r[0] for r in records})
+    events = defaultdict(int)
+    for r in records:
+        events[r[7]] += 1
+    largest = max(records, key=lambda r: (r[2], r[3]))
+    return ("%d %s in %d %s (%d speciation, %d duplication, %d single species); largest %s node %s, "
+            "%d children, %d genes, %d species; details in %s"
+            % (len(records), "polytomy" if len(records) == 1 else "polytomies",
+               n_ogs, "orthogroup" if n_ogs == 1 else "orthogroups",
+               events["speciation"], events["duplication"], events["single species"],
+               largest[0], largest[1], largest[2], largest[3], largest[4], fn))
+
+
+def children_all_share_species(masks):
+    """
+    Whether every pair of a polytomy's children shares a species (their
+    species as bitmasks, SpeciesSets): at once if one species is in all of
+    them, otherwise until the first pair that does not. Children of the same
+    species share them, so only the pairs of different species sets are
+    checked (the children of a large polytomy are mostly of a few).
+    """
+    common = masks[0]
+    for m in masks[1:]:
+        common &= m
+    if common:
+        return True
+    return all(m0 & m1 for m0, m1 in itertools.combinations(set(masks), 2))
+
+
 def orthologs_and_suspect(ch, suspect_genes, misplaced_genes, species_and_gene):
     """
     ch - the two child nodes that are orthologous
@@ -552,13 +860,24 @@ def get_lines_for_ortholog_files(
         ortholog_sus_lines,
         pair_counts=None,
         other_names=None,
+        flush=None,
+        chunk_bytes=None,
     ):
     """
     Add ortholog rows to olog_lines/olog_sus_lines.
 
-    Returns a dense NOrthoSp for these trees. If pair_counts is a list, the
-    (iL, iR, nL, nR) records are appended to it instead and None is returned,
-    which avoids allocating five nspecies x nspecies matrices per tree.
+    Returns a dense NOrthoSp for these trees. If pair_counts (a
+    stats.PendingPairs) is given, the counts are added to it instead and None
+    is returned, which avoids allocating five nspecies x nspecies matrices per
+    tree.
+
+    flush: for a tree with more than chunk_bytes (default CHUNK_BYTES) of rows, called with
+    ({i: text}, {i: text}) (the ortholog and xenologue rows of each species,
+    sorted, see sorted_rows) each time the rows held reach chunk_bytes, and for
+    the rest at the end, instead of adding them to olog_lines/olog_sus_lines:
+    the rows held are bounded, not those of the whole tree (the number of
+    species pairs: hundreds of millions for a tree of tens of thousands of
+    genes). (The caller knows whether it was called.)
 
     other_names: {sequence ID: name} of the "Other" genes of the putative
     xenologues (of several species: <species>_<gene> if two species have genes
@@ -573,6 +892,24 @@ def get_lines_for_ortholog_files(
     # quadratic for large trees.
     ortholog_parts = defaultdict(list)   # i -> rows
     sus_parts = defaultdict(list)    # i -> rows
+    if chunk_bytes is None:
+        chunk_bytes = CHUNK_BYTES
+    held = [0]          # characters of the rows held
+    flushed = [False]
+
+    def sorted_and_freed(parts_of):
+        # each species' rows freed once sorted: not all of them twice in memory
+        texts = {}
+        for i in list(parts_of):
+            parts = parts_of.pop(i)
+            if parts:       # (a species' list can be empty: the pair loop takes it before its rows)
+                texts[i] = sorted_rows(parts)
+        return texts
+
+    def flush_rows():
+        flush(sorted_and_freed(ortholog_parts), sorted_and_freed(sus_parts))
+        held[0] = 0
+        flushed[0] = True
 
     sp_to_i = {str(sp): i for i, sp in enumerate(i_species_to_use)}
     sp_label = [species_dict[str(sp)] for sp in i_species_to_use]
@@ -605,35 +942,44 @@ def get_lines_for_ortholog_files(
         if pair_counts is None:
             n_ortho.add_pair(i_l, i_r, n_l, n_r)
         else:
-            pair_counts.append((i_l, i_r, n_l, n_r))
+            pair_counts.add_pair(i_l, i_r, n_l, n_r)
 
-    def add_ortholog_row(og, sp_l, genes_l, sp_r, genes_r):
-        """
-        Add one species-pair ortholog row in both directions.
-        """
-        sp_l = str(sp_l)
-        sp_r = str(sp_r)
+    def add_held(n_chars):
+        if flush is not None:
+            held[0] += n_chars
+            if held[0] >= chunk_bytes:
+                flush_rows()
 
-        if sp_l == sp_r:
-            return
+    def field(text):
+        # as file_io.unquoted_line: without trailing line breaks
+        return text.rstrip("\r\n") if ("\n" in text or "\r" in text) else text
 
-        if not genes_l or not genes_r:
-            return
+    label_tab = [field(label) + "\t" for label in sp_label]
 
-        i_l = sp_to_i[sp_l]
-        i_r = sp_to_i[sp_r]
+    # The names of a species' genes joined, by its list's id: the lists of a large
+    # polytomy's genes are in many of its grouped entries. Each list is kept with
+    # its text, so that its id is not reused while cached. A MergedGenes list is
+    # of one grouped entry only, so not cached (nor kept).
+    shared_texts = {}
 
-        n_l = len(genes_l)
-        n_r = len(genes_r)
+    def species_texts(leaves, q_shared=False):
+        """(i, its genes' names joined, number of genes) of each species with genes, in species order."""
+        texts = []
+        for sp in sorted(leaves.keys(), key=lambda sp: sp_to_i[str(sp)]):
+            genes = leaves[sp]
+            if genes:
+                q_cached = q_shared and type(genes) is not MergedGenes
+                text = shared_texts[id(genes)][1] if q_cached and id(genes) in shared_texts else None
+                if text is None:
+                    text = field(join_gene_names(str(sp), genes))
+                    if q_cached:
+                        shared_texts[id(genes)] = (genes, text)
+                texts.append((sp_to_i[str(sp)], text, len(genes)))
+        return texts
 
-        text_l = join_gene_names(sp_l, genes_l)
-        text_r = join_gene_names(sp_r, genes_r)
-
-        # (one file per species: OG, the other species, the genes of each)
-        ortholog_parts[i_l].append(getrow((og, sp_label[i_r], text_l, text_r)))
-        ortholog_parts[i_r].append(getrow((og, sp_label[i_l], text_r, text_l)))
-
-        add_stats(i_l, i_r, n_l, n_r)
+    def add_polytomy_counts(species, *counts):
+        idx = [sp_to_i[str(sp)] for sp in species]
+        (n_ortho if pair_counts is None else pair_counts).add_polytomy(idx, *counts)
 
     def add_suspect_row(og, sp_l, genes_l, sp_r, genes_r):
         sp_l = str(sp_l)
@@ -653,73 +999,107 @@ def get_lines_for_ortholog_files(
         other_l = join_other_names(sp_l, genes_l)
         other_r = join_other_names(sp_r, genes_r)
 
-        sus_parts[i_l].append(getrow((og, text_l, other_r)))
-        sus_parts[i_r].append(getrow((og, text_r, other_l)))
+        row_l = getrow((og, text_l, other_r))
+        row_r = getrow((og, text_r, other_l))
+        sus_parts[i_l].append(row_l)
+        sus_parts[i_r].append(row_r)
+        add_held(len(row_l) + len(row_r))
+
+    def add_rows(og_tab, side_l, side_r, q_count):
+        # One row per pair of species, in both directions (one file per
+        # species: OG, the other species, the genes of each).
+        for i_l, text_l, n_l in side_l:
+            parts_l = ortholog_parts[i_l]
+            head_l = og_tab + label_tab[i_l]
+            tail_l = "\t" + text_l + "\n"
+            for i_r, text_r, n_r in side_r:
+                if i_l == i_r:
+                    continue
+                row_l = og_tab + label_tab[i_r] + text_l + "\t" + text_r + "\n"
+                row_r = head_l + text_r + tail_l
+                parts_l.append(row_l)
+                ortholog_parts[i_r].append(row_r)
+
+                if q_count:
+                    add_stats(i_l, i_r, n_l, n_r)
+                if flush is not None:
+                    held[0] += len(row_l) + len(row_r)
+                    if held[0] >= chunk_bytes:
+                        flush_rows()
+                        parts_l = ortholog_parts[i_l]
+
+    def add_suspect_rows(og, leaves_l, leaves_r, leaves_l_sus, leaves_r_sus):
+        leaves_sus = (leaves_l_sus, leaves_r_sus)
+        leaves_norm = (leaves_l, leaves_r)
+
+        for i_pair in range(2):
+            leaves_sus0 = leaves_sus[i_pair]
+            leaves_sus1 = leaves_sus[1 - i_pair]
+            leaves_norm1 = leaves_norm[1 - i_pair]
+
+            partner_species = dict.fromkeys(
+                list(leaves_norm1.keys()) + list(leaves_sus1.keys())
+            )
+
+            for sp0 in sorted(leaves_sus0.keys(), key=lambda sp: sp_to_i[str(sp)]):
+                genes0 = leaves_sus0[sp0]
+
+                if not genes0:
+                    continue
+
+                for sp1 in sorted(partner_species.keys(), key=lambda sp: sp_to_i[str(sp)]):
+                    if str(sp0) == str(sp1):
+                        continue
+
+                    genes1 = (
+                        list(leaves_norm1.get(sp1, [])) +
+                        list(leaves_sus1.get(sp1, []))
+                    )
+
+                    if not genes1:
+                        continue
+
+                    add_suspect_row(
+                        og,
+                        sp0,
+                        genes0,
+                        sp1,
+                        genes1
+                    )
 
     for iog, orthologs_onetree in orthologs_alltrees:
         og = "OG%07d" % iog
 
-        for leaves_l, leaves_r, leaves_l_sus, leaves_r_sus in orthologs_onetree:
-            for sp_l in sorted(leaves_l.keys(), key=lambda sp: sp_to_i[str(sp)]):
-                genes_l = leaves_l[sp_l]
+        og_tab = field(og) + "\t"
 
-                if not genes_l:
-                    continue
-
-                for sp_r in sorted(leaves_r.keys(), key=lambda sp: sp_to_i[str(sp)]):
-                    genes_r = leaves_r[sp_r]
-
-                    if not genes_r:
-                        continue
-
-                    add_ortholog_row(
-                        og,
-                        sp_l,
-                        genes_l,
-                        sp_r,
-                        genes_r
-                    )
-
-            if not q_contains_suspect_orthologs:
+        for entry in orthologs_onetree:
+            if type(entry) is PolytomyOrthologs:
+                # counted per pair of groups of its children
+                add_polytomy_counts(*entry.counts)
+                # (one grouped entry at a time: those of the later groups' genes merged are not all held)
+                for leaves_l, leaves_r, leaves_l_sus, leaves_r_sus in entry.grouped_entries():
+                    side_l = species_texts(leaves_l, True)
+                    side_r = species_texts(leaves_r, True) if side_l else []
+                    add_rows(og_tab, side_l, side_r, False)
+                    if q_contains_suspect_orthologs:
+                        add_suspect_rows(og, leaves_l, leaves_r, leaves_l_sus, leaves_r_sus)
+                shared_texts.clear()
                 continue
 
-            leaves_sus = (leaves_l_sus, leaves_r_sus)
-            leaves_norm = (leaves_l, leaves_r)
+            leaves_l, leaves_r, leaves_l_sus, leaves_r_sus = entry
+            # Each species' genes are named and joined once per node, not once
+            # per pair of species.
+            side_l = species_texts(leaves_l)
+            side_r = species_texts(leaves_r) if side_l else []
+            add_rows(og_tab, side_l, side_r, True)
 
-            for i_pair in range(2):
-                leaves_sus0 = leaves_sus[i_pair]
-                leaves_sus1 = leaves_sus[1 - i_pair]
-                leaves_norm1 = leaves_norm[1 - i_pair]
+            if q_contains_suspect_orthologs:
+                add_suspect_rows(og, leaves_l, leaves_r, leaves_l_sus, leaves_r_sus)
 
-                partner_species = dict.fromkeys(
-                    list(leaves_norm1.keys()) + list(leaves_sus1.keys())
-                )
-
-                for sp0 in sorted(leaves_sus0.keys(), key=lambda sp: sp_to_i[str(sp)]):
-                    genes0 = leaves_sus0[sp0]
-
-                    if not genes0:
-                        continue
-
-                    for sp1 in sorted(partner_species.keys(), key=lambda sp: sp_to_i[str(sp)]):
-                        if str(sp0) == str(sp1):
-                            continue
-
-                        genes1 = (
-                            list(leaves_norm1.get(sp1, [])) +
-                            list(leaves_sus1.get(sp1, []))
-                        )
-
-                        if not genes1:
-                            continue
-
-                        add_suspect_row(
-                            og,
-                            sp0,
-                            genes0,
-                            sp1,
-                            genes1
-                        )
+    if flushed[0]:
+        if any(ortholog_parts.values()) or any(sus_parts.values()):
+            flush_rows()
+        return n_ortho
 
     for i, parts in ortholog_parts.items():
         ortholog_lines[i] += "".join(parts)

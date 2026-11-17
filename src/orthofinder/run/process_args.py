@@ -28,6 +28,9 @@ from ..utils import util, file_handler, paths, program_caller, printing
 from ..utils.printing import printer
 from . import cli_options, helpinfo, previous_run
 
+# The trimming program of a run without --trim (config.json)
+DEFAULT_TRIM_PROGRAM = "clipkit"
+
 try:
     from rich import print
 except ImportError:
@@ -78,6 +81,7 @@ class Options(object):
         self.min_seq = 4
         self.msa_min_seq = 10
         self.q_trim = True
+        self.trim_program = DEFAULT_TRIM_PROGRAM  # --trim: a trimming program of config.json (None: OrthoFinder's own trimming)
         self.q_add_species_to_ids = True
         self.q_split_para_clades = False
         self.species_tree_fn = None
@@ -91,6 +95,10 @@ class Options(object):
         self.orthoxml = False  # --orthoxml (-x): also write the orthogroups and HOGs as OrthoXML
         self.species_tree_alignment = False  # --concat-alignment: with -ST, also write the concatenated alignment
         self.mcl_orthogroups = False  # -mog: also keep the MCL orthogroups (MCL_Orthogroups.*)
+        self.keep_dropped = False  # --keep-dropped: also save the columns trimming removed from each MSA
+        self.trim_given = False  # --trim given (any value): the trimming of the MSAs of -M msa
+        self.no_trim_given = False  # -z given (not with --trim, unless --trim none)
+        self.trim_gaps = "-*"  # the gaps and unknown characters of the trimming (trim_gaps)
         # pages to look at the results in a web browser (--view: all three)
         self.tree_view = False  # --tree-view: the trees
         self.stats_view = False  # --stats-view: the statistics, with plots
@@ -270,6 +278,7 @@ class _Reading(object):
         self.results_dir_non_default = None
         self.q_selected_msa = False
         self.q_selected_tree = False
+        self.q_selected_trim = None    # the value of --trim
         self.user_specified_m = False
         self.given = set()   # the options that can only be given once, by their first name
         self.scoring = {}    # --matrix, --custom-matrix, --gapopen, --gapextend: their values
@@ -313,6 +322,13 @@ def _read_options(args, prog_caller):
             raise ArgumentError(str(e))
         options.score_matrix_given = True
 
+    if options.no_trim_given and r.q_selected_trim not in (None, "none"):
+        raise ArgumentError("-z (no trimming) cannot be used with --trim %s" % r.q_selected_trim)
+    # (not the sequence type: -d of a run being continued is restored later, check_trimming)
+    error = trimming_error(options, prog_caller, q_sequence_type=False)
+    if error:
+        raise ArgumentError(error)
+
     # the default number of algorithm threads: a quarter of -t, at least 1 (each is a process
     # with its own copy of the data, so fewer than -t; -t is at most the cores, so this is
     # at most a quarter of them)
@@ -320,6 +336,68 @@ def _read_options(args, prog_caller):
         options.n_process_alg = default_alg_threads(options.n_blast)
     return (options, r.fasta_dir, r.continuation_dir, r.results_dir_non_default, r.q_selected_msa,
             r.q_selected_tree, r.user_specified_m)
+
+
+def trimming_error(options, prog_caller, q_sequence_type=True):
+    """
+    Why the trimming options (--trim, --keep-dropped, -z) cannot be used, or
+    None. q_sequence_type: also whether the program trims the input's
+    sequences (-d), once the settings of a run being continued are restored.
+    -M is checked both before and after they are (it is one of them).
+    """
+    # (any --trim, none too: the trimming of the MSAs of -M msa)
+    if (options.trim_given or options.keep_dropped) and not options.q_msa_trees:
+        return "--trim and --keep-dropped (trimming of the MSAs) also require option '-M msa'"
+    if options.q_trim and options.trim_program is not None:
+        if options.trim_program not in prog_caller.list_trim_methods():
+            # e.g. restored for a restart, from a config file no longer given
+            return ('The trimming program "%s" is not configured (program_type "trim" in config.json '
+                    'or a file given with --config)' % options.trim_program)
+        sequence_type = prog_caller.get_trim_program(options.trim_program).sequence_type
+        input_type = "dna" if options.dna else "protein"
+        if q_sequence_type and sequence_type is not None and sequence_type != input_type:
+            others = [name for name in prog_caller.list_trim_methods()
+                      if prog_caller.get_trim_program(name).sequence_type == input_type]
+            return ('--trim %s trims %s alignments only (sequence_type in its config.json entry), but the input '
+                    'is %s%s' % (options.trim_program, "nucleotide" if sequence_type == "dna" else "protein",
+                                 "nucleotide (-d)" if options.dna else "protein",
+                                 ". Use --trim %s instead" % others[0] if others else ""))
+    if options.keep_dropped:
+        if not options.q_trim:
+            return "--keep-dropped saves the columns trimming removes, but the MSAs are not trimmed (-z or --trim none)"
+        if options.trim_program is not None and \
+                not prog_caller.get_trim_program(options.trim_program).writes_dropped():
+            return ('--keep-dropped cannot be used with --trim %s: its config.json entry does not say how it '
+                    'writes the columns it removes (cmd_line_dropped or complement_suffix)' % options.trim_program)
+    return None
+
+
+def check_trimming(options, prog_caller):
+    """Fails if the trimming options cannot be used (trimming_error)."""
+    error = trimming_error(options, prog_caller)
+    if error:
+        print("ERROR: %s\n" % error)
+        util.fail()
+
+
+def trim_gaps(options, prog_caller):
+    """
+    The characters the run's trimming treats as gaps or unknown (trim.TrimProgram.gaps):
+    OrthoFinder's trimming's, or a program's for the input's sequence type (-d).
+    """
+    from ..gene_tree import trim
+    if options.trim_program is not None and options.trim_program in prog_caller.list_trim_methods():
+        return prog_caller.get_trim_program(options.trim_program).gaps(options.dna)
+    return trim.DEFAULT_GAP_CHARACTERS
+
+
+def make_trimmer(options, prog_caller):
+    """How the run trims its MSAs (a trim.Trimmer), None without trimming (the options checked at the start, check_trimming)."""
+    from ..gene_tree import trim
+    if not options.q_trim:
+        return None
+    program = None if options.trim_program is None else prog_caller.get_trim_program(options.trim_program)
+    return trim.Trimmer(program, options.keep_dropped, options.dna)
 
 
 # ------------------------------------------- the readers of the options ----
@@ -464,6 +542,15 @@ def _read_tree(r, option, arg, args):
     r.q_selected_tree = True
 
 
+def _read_trim(r, option, arg, args):
+    _once(r, option)
+    value = _choice(arg, args, ["orthofinder", "none"] + r.prog_caller.list_trim_methods())
+    r.options.q_trim = value != "none"
+    r.options.trim_program = None if value in ("orthofinder", "none") else value
+    r.options.trim_given = True
+    r.q_selected_trim = value
+
+
 def _read_scoring(r, option, arg, args):
     # by the long name: --matrix, --custom-matrix, --gapopen, --gapextend
     name = next(n for n in option["names"] if n.startswith("--"))
@@ -506,6 +593,7 @@ READERS = {
     "method": _read_method,
     "msa": _read_msa,
     "tree": _read_tree,
+    "trim": _read_trim,
     "scoring": _read_scoring,
     "help": _read_help,
     "version": _read_version,

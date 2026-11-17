@@ -39,6 +39,7 @@ import itertools
 import zlib
 from collections import Counter, defaultdict
 from ..phylo import tree
+from ..orthology import rooting
 from ..utils import parallel_task_manager
 
 PY2 = sys.version_info <= (3,)
@@ -47,8 +48,9 @@ csv_write_mode = 'wb' if PY2 else 'wt'
 def compare(exp, act):
     """exp - expected set of species
     act - actual set of species
+    (both as bitmasks of the species)
     """
-    return act.issubset(exp)
+    return act & ~exp == 0
 
 criteria = "crit_all"
 
@@ -68,19 +70,20 @@ class Node(object):
         
     def get_child_species_clades(self, c):
         nodes = [c] if c.is_leaf() else c.get_children()  # what if non-binary?
-        return [ch.sp_down for ch in nodes]
+        return [ch.spm_down for ch in nodes]
         
     def get_grandchild_species_clades(self, c):
         if c.is_root(): raise Exception
         if c.is_leaf():
-            return [[c.sp_down]]
+            return [[c.spm_down]]
         else:
             return [self.get_child_species_clades(ch) for ch in c.get_children()]
 
     def get_up_grand_species_clades(self):
         """ 
+        None if the tree is non-binary in the vicinity of the node (the node is skipped)
         Exceptions:
-        - if tree is non-binary
+        - if the node is the root
         """
         if self.node.is_root(): 
             children = self.node.get_children()
@@ -103,23 +106,23 @@ class Node(object):
             c1 = ch_temp[0] if ch_temp[0] != self.node else ch_temp[1]
             c1clades = self.get_child_species_clades(c1)
             # difficult one
-            if len(ancestors) < 2: raise Exception("Expected binary tree")
+            if len(ancestors) < 2: return None
             c2 = ancestors[1]
             ch_temp = c2.get_children()  
             if c2.is_root() and len(ch_temp) == 3:
                 # easy - both are children
                 c21, c22 = ch_temp[:2] if ch_temp[2] == c else ch_temp[1:3] if ch_temp[0] == c else (ch_temp[0], ch_temp[2])
-                c21clade = c21.sp_down
-                c22clade = c22.sp_down
+                c21clade = c21.spm_down
+                c22clade = c22.spm_down
             elif (not c2.is_root()) and len(ch_temp) == 2:
                 c21 = ch_temp[0] if ch_temp[0] != c else ch_temp[1]
-                c21clade = c21.sp_down
-                c22clade = c2.sp_up     # c21clade = everything not in the others, work out at the end
+                c21clade = c21.spm_down
+                c22clade = c2.spm_up    # c21clade = everything not in the others, work out at the end
             else:
-                raise Exception("Expected binary tree")
+                return None
             return [c1clades, [c21clade, c22clade]]
         else:
-            raise Exception("Expected binary tree")
+            return None
       
     def get_up_genes(self, n_max):
         if self.node.is_root(): 
@@ -156,7 +159,8 @@ class Node(object):
       
     def get_grandrelative_clades_stored(self):
         """
-        returns the hierarchically stored sets of species 
+        returns the hierarchically stored sets of species (bitmasks, store_species_masks),
+        None if the tree is non-binary in the vicinity of the node
         """
         if self.node.is_root():
             children = self.node.get_children()
@@ -166,7 +170,9 @@ class Node(object):
             children = self.node.get_children()
             if len(children) != 2: return None
             down_clades = [self.get_grandchild_species_clades(c) for c in children]
-            return down_clades + [self.get_up_grand_species_clades()]
+            up_clades = self.get_up_grand_species_clades()
+            if up_clades is None: return None
+            return down_clades + [up_clades]
             
     # def GetSpeciesSets(self, allTaxa, gene_map):
     #     if self.node.is_root():
@@ -198,27 +204,6 @@ def get_partitions(tree):
         all_partitions.add(p2)
      return all_partitions      
    
-def store_species_sets(t, gene_map, all_taxa):
-    for node in t.traverse('postorder'):
-        if node.is_leaf():
-            node.add_feature('sp_down', {gene_map(node.name)})
-        elif node.is_root():
-            continue
-        else:
-            node.add_feature('sp_down', set.union(*[ch.sp_down for ch in node.get_children()]))
-    for node in t.traverse('preorder'):
-        if node.is_root():
-            node.add_feature('sp_up', set())
-        else:
-            parent = node.up
-            if parent.is_root():
-                others = [ch for ch in parent.get_children() if ch != node]
-                node.add_feature('sp_up', set.union(*[other.sp_down for other in others]))
-            else:
-                others = [ch for ch in parent.get_children() if ch != node]
-                sp_downs = set.union(*[other.sp_down for other in others])
-                node.add_feature('sp_up', parent.sp_up.union(sp_downs))
-      
 # def SaveTree(tree, root_clade, cladeName, treeName, iExample):
 #     fn = outputDir + "/%s_%s_%d_%d.tre" % (cladeName, os.path.split(treeName)[1].split(".")[0], iExample, len(root_clade))
 #     t = root_at_clade(tree, root_clade)
@@ -249,13 +234,14 @@ def store_species_sets(t, gene_map, all_taxa):
 #                 node.add_feature('g_up', x)
 
 def get_stored_species_sets(node):
+    """The species of the three clades about node, as bitmasks (store_species_masks)."""
     children = node.get_children()
     if node.is_root():
         if len(children) != 3: return None
-        return [ch.sp_down for ch in children]
+        return [ch.spm_down for ch in children]
     else:
         if len(children) != 2: return None
-        return [ch.sp_down for ch in children] + [node.sp_up]
+        return [ch.spm_down for ch in children] + [node.spm_up]
         
 # def GetStoredGeneSets(node):
 #     children = node.get_children()
@@ -284,9 +270,10 @@ def gene_to_species_dash(g):
 def local_check_clades(clade1, clade2, exp_clades, GeneToSpecies):
     """Expected clades are now in tree structure going down two levels: [[A,B], [C,D]]
     Observed clades should match up with expected clades in terms of containing no unexpected species
+    (all as bitmasks of the species)
     """   
-    X = set.union(*exp_clades[0])
-    Y = set.union(*exp_clades[1])
+    X = join([exp_clades[0]])
+    Y = join([exp_clades[1]])
     x0, x1 = exp_clades[0] if len(exp_clades[0]) == 2 else (None, None) if len(exp_clades[0]) == 1 else (Exception, Exception)
     y0, y1 = exp_clades[1] if len(exp_clades[1]) == 2 else (None, None) if len(exp_clades[1]) == 1 else (Exception, Exception)
     if x0 == Exception or y0 == Exception: 
@@ -324,26 +311,36 @@ def local_check_clades(clade1, clade2, exp_clades, GeneToSpecies):
     return True 
 
 def join(clades):
-     return set([s for child in clades for grandchild in child for s in grandchild])
+    """The union of the bitmasks of clades (a list of lists)."""
+    m = 0
+    for child in clades:
+        for grandchild in child:
+            m |= grandchild
+    return m
      
 class CladeIndex(object):
     """
     The clades of the species tree (the keys of dict_clades) as bitmasks of their
     species, sorted by size, to find the smallest clades containing a set of
     species without testing it against every clade: with n species there are
-    ~2n clades, tested for each node of each gene tree (~n nodes).
+    ~2n clades, tested for each node of each gene tree (~n nodes). Also each
+    species' bit (bit_of, of species too), and each clade's two-level clades
+    of dict_clades as bitmasks (expected).
     """
 
-    def __init__(self, dict_clades):
+    def __init__(self, dict_clades, species=()):
         self.bit = {}
-        for clade in dict_clades:
-            for sp in clade:
+        for clade in itertools.chain(dict_clades, [species]):
+            for sp in sorted(clade):
                 if sp not in self.bit:
                     self.bit[sp] = len(self.bit)
+        self.bit_of = {sp: 1 << b for sp, b in self.bit.items()}
+        self.species_of_bit = {1 << b: sp for sp, b in self.bit.items()}
         entries = sorted(((len(k), self.mask(k), k) for k in dict_clades), key=lambda e: e[0])
         self.sizes = [e[0] for e in entries]
         self.masks = [e[1] for e in entries]
         self.clades = [e[2] for e in entries]
+        self.expected = {k: [[self.mask(c) for c in clade0] for clade0 in v] for k, v in dict_clades.items()}
 
     def mask(self, species_set):
         bit = self.bit
@@ -355,18 +352,15 @@ class CladeIndex(object):
             m |= 1 << b
         return m
 
-    def smallest_containing(self, species_set):
+    def smallest_containing(self, m):
         """
-        The set of the smallest clades containing species_set (those of the same,
-        smallest size), as the keys of dict_clades; empty if none does.
+        The set of the smallest clades containing the species of bitmask m (those
+        of the same, smallest size), as the keys of dict_clades; empty if none does.
         """
         found = set()
-        m = self.mask(species_set)
-        if m is None:
-            return found
         sizes, masks, clades = self.sizes, self.masks, self.clades
         size_found = None
-        for k in range(bisect.bisect_left(sizes, len(species_set)), len(sizes)):
+        for k in range(bisect.bisect_left(sizes, m.bit_count()), len(sizes)):
             if size_found is not None and sizes[k] > size_found:
                 break
             if m & masks[k] == m:
@@ -381,12 +375,13 @@ def supported_hierachies(t, G, S, GeneToSpecies, species, dict_clades, clade_nam
     Only get the species sets in the first instance as work out the clades as and when
     """
     if clade_index is None:
-        clade_index = CladeIndex(dict_clades)
+        clade_index = CladeIndex(dict_clades, species)
     q_ancient = False
     supported = defaultdict(int)
     genes_post_dup = set()
-    # Pre-calcualte species sets on tree: traverse tree from leaves inwards
-    store_species_sets(t, GeneToSpecies, G)
+    # Pre-calcualte species sets on tree: traverse tree from leaves inwards (as bitmasks:
+    # sets of the species at each node were ~n^2 for a gene tree of n species)
+    rooting.store_species_masks(t, GeneToSpecies, clade_index.bit_of)
 
     # if qWriteDupTrees:
     #     t_write = None
@@ -406,10 +401,11 @@ def supported_hierachies(t, G, S, GeneToSpecies, species, dict_clades, clade_nam
         for i, j in itertools.combinations(range3, 2):
             s1 = sp_sets[i]
             s2 = sp_sets[j]
+            n1, n2 = s1.bit_count(), s2.bit_count()
             # check for terminal duplications
-            if len(s1) == 1 and s1 == s2:
-                supported[frozenset(s1)] += 1
-            if min(len(s1), len(s2)) < 2: continue
+            if n1 == 1 and s1 == s2:
+                supported[frozenset([clade_index.species_of_bit[s1]])] += 1
+            if min(n1, n2) < 2: continue
             # the smallest clades of the species tree containing s1, and s2
             edges1 = clade_index.smallest_containing(s1)
             edges2 = clade_index.smallest_containing(s2)
@@ -423,12 +419,13 @@ def supported_hierachies(t, G, S, GeneToSpecies, species, dict_clades, clade_nam
                         #print(treeName)
                         q_ancient = True
                     break
-                elif all([not clade.isdisjoint(s1) for clade0 in dict_clades[k1] for clade in clade0]) and all([not clade.isdisjoint(s2) for clade0 in dict_clades[k1] for clade in clade0]):
+                elif all([clade & s1 for clade0 in clade_index.expected[k1] for clade in clade0]) and all([clade & s2 for clade0 in clade_index.expected[k1] for clade in clade0]):
                     # Passed the check that the required species are present but at this point don't know where in the tree
                     # Get grandchild clades as required (could still avoid the more costly up clade if it's not required)
                     if clades == None:
                         N = Node(n)
                         clades = N.get_grandrelative_clades_stored()
+                        if clades is None: break   # locally non-binary in vicinity of node, skip to next node
                         if join(clades[0]) != sp_sets[0] or join(clades[1]) != sp_sets[1] or join(clades[2]) != sp_sets[2]:
                             print((clades[0]))
                             print((sp_sets[0]))
@@ -440,8 +437,7 @@ def supported_hierachies(t, G, S, GeneToSpecies, species, dict_clades, clade_nam
                             print((sp_sets[2]))
                             print("")
                             raise Exception("Mismatch")
-                        if clades == None: break   # locally non-binary in vicinity of node, skip to next node
-                    if not local_check_clades(clades[i], clades[j], dict_clades[k1], GeneToSpecies): continue
+                    if not local_check_clades(clades[i], clades[j], clade_index.expected[k1], GeneToSpecies): continue
                     supported[frozenset(k1)] +=1
                     genes = N.get_gene_sets(i, j)
                     genes_post_dup.add(genes[0].union(genes[1]))
@@ -500,7 +496,7 @@ def _init_worker(GeneToSpecies, species, dict_clades, clade_names, q_write_dup_t
     _WORKER.update(
         GeneToSpecies=GeneToSpecies, species=species, dict_clades=dict_clades,
         clade_names=clade_names, q_write_dup_trees=q_write_dup_trees,
-        clade_index=CladeIndex(dict_clades),
+        clade_index=CladeIndex(dict_clades, species),
     )
 
 
@@ -536,6 +532,11 @@ def supported_hierachies_wrapper(
 
     if len(S) < 3:
         return defaultdict(int), set()
+
+    # (a gene tree is unrooted, its root of three: one rooted on a split of two
+    # made so, rather than its root's children skipped)
+    if len(t.get_children()) == 2:
+        t.unroot()
 
     supported, genes_post_dup = supported_hierachies(
         t,

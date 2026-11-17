@@ -17,6 +17,8 @@ The script expects each ZIP archive to contain:
   - a GFF file ending with: genomic.gff
 
 For each gene, the longest protein sequence is written to the output FASTA file.
+A gene is a locus, by its NCBI GeneID (else its locus_tag, else its gene symbol),
+not a gene symbol alone, which different loci can share.
 """
 
 import os
@@ -57,7 +59,33 @@ def parse_fasta(fasta_file):
     return protein_dict
 
 
+def gff_attributes(text):
+    """The attributes (column 9) of a GFF3 line, as {key: value}."""
+    attributes = {}
+    for item in text.split(";"):
+        key, sep, value = item.partition("=")
+        if sep:
+            attributes[key.strip()] = value.strip()
+    return attributes
+
+
+def gene_locus(attributes):
+    """
+    (the gene locus of a CDS's attributes, its gene symbol): the locus by its
+    NCBI GeneID (Dbxref), else its locus_tag, else its symbol (gene). A symbol
+    alone is not a locus: different loci can have the same symbol.
+    """
+    symbol = attributes.get("gene")
+    for xref in attributes.get("Dbxref", "").split(","):
+        if xref.startswith("GeneID:"):
+            return xref, symbol
+    if "locus_tag" in attributes:
+        return "locus_tag:" + attributes["locus_tag"], symbol
+    return (None if symbol is None else "gene:" + symbol), symbol
+
+
 def parse_gff(gff_file):
+    """{protein_id: (its gene locus, its gene symbol)} of the CDSs of a GFF3 file."""
     gene_map = {}
 
     with open(gff_file, "r", encoding="utf-8") as gff:
@@ -70,36 +98,38 @@ def parse_gff(gff_file):
             if len(fields) < 9:
                 continue
 
-            attributes = fields[8]
-
-            if "protein_id=" in attributes and "gene=" in attributes:
-                protein_id = attributes.split("protein_id=")[-1].split(";")[0]
-                gene = attributes.split("gene=")[-1].split(";")[0]
-                gene_map[protein_id] = gene
+            attributes = gff_attributes(fields[8])
+            protein_id = attributes.get("protein_id")
+            locus, symbol = gene_locus(attributes)
+            if protein_id is not None and locus is not None:
+                gene_map[protein_id] = (locus, symbol)
 
     return gene_map
 
 
 def get_longest_transcripts(protein_dict, gene_map):
+    """{gene locus: (protein_id, sequence, symbol)}: the longest protein of each locus."""
     gene_transcripts = defaultdict(list)
 
     for protein_id, sequence in protein_dict.items():
         if protein_id in gene_map:
-            gene = gene_map[protein_id]
-            gene_transcripts[gene].append((protein_id, sequence))
+            locus, symbol = gene_map[protein_id]
+            gene_transcripts[locus].append((protein_id, sequence, symbol))
 
     longest_transcripts = {}
 
-    for gene, transcripts in gene_transcripts.items():
-        longest_transcripts[gene] = max(transcripts, key=lambda x: len(x[1]))
+    for locus, transcripts in gene_transcripts.items():
+        longest_transcripts[locus] = max(transcripts, key=lambda x: len(x[1]))
 
     return longest_transcripts
 
 
 def write_longest_fasta(output_file, longest_transcripts):
+    # (by gene symbol as before, a locus without one by its locus)
     with open(output_file, "w", encoding="utf-8", newline="\n") as out_fasta:
-        for gene, (protein_id, sequence) in sorted(longest_transcripts.items()):
-            out_fasta.write(f">{protein_id} gene={gene}\n")
+        for locus, (protein_id, sequence, symbol) in sorted(
+                longest_transcripts.items(), key=lambda item: (item[1][2] or item[0], item[0])):
+            out_fasta.write(f">{protein_id} gene={symbol or locus.split(':', 1)[1]}\n")
             out_fasta.write(f"{sequence}\n")
 
 

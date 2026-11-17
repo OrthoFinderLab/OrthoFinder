@@ -39,7 +39,7 @@ def get_orthologs(
         options.n_process_alg,
         options.q_double_blast,
         options.q_add_species_to_ids,
-        options.q_trim,
+        process_args.make_trimmer(options, prog_caller),
         options.cmd_order,
         options.method_threads,
         user_species_tree=options.species_tree_fn,

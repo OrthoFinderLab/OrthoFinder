@@ -45,6 +45,58 @@ from .. import pic_protocol
 _PACK_MAGIC = b"OFPACK1\n"
 
 
+class CompactCSR(object):
+    """
+    A CSR block of one pair of species, as it is stored and held: only its
+    rows with entries (their numbers and entry counts), with its column
+    indices and values. A CSR matrix has a row pointer for every row, entries
+    or not: for each pair of species, a species' every gene (381 MiB of them
+    for a species of 20,000 genes against 5,000 species, in memory and in
+    each pack file), never fewer bytes than this. tocsr() gives the CSR
+    matrix it was made from: the same arrays, entries in the same order.
+    """
+    __slots__ = ("shape", "rows", "counts", "indices", "data")
+
+    def __init__(self, m):
+        counts = np.diff(m.indptr)
+        self.shape = m.shape
+        self.rows = np.flatnonzero(counts).astype(m.indptr.dtype)
+        self.counts = counts[self.rows]
+        self.indices = m.indices
+        self.data = m.data
+
+    def __getstate__(self):
+        return (self.shape, self.rows, self.counts, self.indices, self.data)
+
+    def __setstate__(self, state):
+        self.shape, self.rows, self.counts, self.indices, self.data = state
+
+    @property
+    def nnz(self):
+        return len(self.data)
+
+    def get_shape(self):
+        return self.shape
+
+    def tocsr(self):
+        from scipy import sparse
+        indptr = np.zeros(self.shape[0] + 1, dtype=self.rows.dtype)
+        indptr[self.rows + 1] = self.counts
+        np.cumsum(indptr, out=indptr)
+        return sparse.csr_matrix((self.data, self.indices, indptr), shape=self.shape)
+
+
+def compact(m):
+    """A CSR matrix as a CompactCSR (anything else as it is)."""
+    from scipy import sparse
+    return CompactCSR(m) if sparse.isspmatrix_csr(m) else m
+
+
+def as_csr(m):
+    """A block (a CompactCSR or a scipy matrix) as a CSR matrix (a CSR matrix itself, not a copy)."""
+    return m.tocsr()
+
+
 def _pack_fn(name, i_species, d_pickle):
     return d_pickle + "%s%d.pack" % (name, i_species)
 
@@ -68,7 +120,7 @@ def dump_matrix_array(name, matrix_array, i_species, d_pickle):
         f.write(b"\0" * (len(_PACK_MAGIC) + 8 * (n + 2)))   # header, filled in below
         for j_species, m in enumerate(matrix_array):
             offsets[j_species] = f.tell()
-            pic.dump(m, f, protocol=pic_protocol)
+            pic.dump(compact(m), f, protocol=pic_protocol)
         offsets[n] = f.tell()
         f.seek(0)
         f.write(_PACK_MAGIC)
@@ -116,13 +168,14 @@ def load_matrix_array(name, seqs_info, i_species, d_pickle, row=True):
 def matrices_and_s(xarr, yarr):
     zarr = []
     for x, y in zip(xarr, yarr):
-        zarr.append(x.multiply(y))
+        zarr.append(as_csr(x).multiply(as_csr(y)))
     return zarr
                 
 def matrices_and_tr_s(xarr, yarr):
+    """x.multiply(y.T) for each pair, the results as CompactCSR (a block at a time as CSR)."""
     zarr = []
     for x, y in zip(xarr, yarr):
-        zarr.append(x.multiply(y.transpose()))
+        zarr.append(compact(as_csr(as_csr(x).multiply(as_csr(y).transpose()))))
     return zarr   
     
 def delete_matrices(base_name, d_pickle):

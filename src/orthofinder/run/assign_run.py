@@ -121,7 +121,7 @@ def between_core_orthogroups_workflow(
             options.n_process_alg,
             options.q_double_blast,
             options.q_add_species_to_ids,
-            options.q_trim,
+            process_args.make_trimmer(options, prog_caller),
             cmd_order=options.cmd_order,
             method_threads=options.method_threads,
             user_species_tree=None,

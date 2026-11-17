@@ -15,10 +15,17 @@ try:
 except ImportError:
     ...
 
-from ..utils import parallel_task_manager
+from ..utils import parallel_task_manager, system_info
 from ..utils import printing
 from . import stats
-from .ortholog_writers import non_hog_writer_process, ordered_hog_writer_process, partition_non_hog_result
+from .ortholog_writers import non_hog_writer_process, ordered_hog_writer_process, partition_non_hog_result, partition_chunk, \
+    chunk_size
+
+
+
+# A worker holds its ortholog counts (5 species x species matrices) up to this size, else it
+# sends them to the parent as it makes them (smaller this way: no memory for sending them)
+WORKER_DENSE_COUNT_BYTES = 64 * 1024 * 1024
 
 
 def get_n_writer_processes(
@@ -44,6 +51,16 @@ def get_n_writer_processes(
     )
 
 
+# The large trees' ortholog rows sent to the writers and not yet on disk, of all the
+# workers (tree_analyser.CHUNK_BYTES each at most): the writer queues are bounded by
+# their number of messages only, and the largest trees, which are analysed first,
+# would otherwise fill them with chunks at once.
+CHUNKS_IN_FLIGHT_BYTES = 1024 ** 3
+# ... or this fraction of the memory the run can use, if more (system_info.memory_budget).
+# (Not tree_analyser.CHUNK_BYTES: whether a tree is sent in chunks decides how its rows are
+# written, so where the gzip files' members end, ortholog_writers.GzipBuffers.)
+CHUNKS_IN_FLIGHT_FRACTION = 1 / 16
+
 # The skips a worker holds per writer before sending them (worker_run_orthologs_method_pipeline)
 SKIP_BATCH = 64
 
@@ -58,17 +75,29 @@ def worker_run_orthologs_method_pipeline(
         need_ortholog_output,
         n_orthologs_cache=100,
         write_hog_tree=False,
+        chunk_budget=None,
     ):
     """
     Analyse OGs and route HOG and non-HOG output independently.
 
+    chunk_budget: the ByteBudget a large tree's chunk of rows is acquired from
+    before it is sent (given back by the writer once it is on disk).
+
     Ortholog counts are accumulated locally and sent once with
-    "worker_done". Sending a dense nspecies x nspecies count object per OG
-    is ~40 MB of pickled data per OG at 1,000 species.
+    "worker_done" while the dense nspecies x nspecies count object is at most
+    WORKER_DENSE_COUNT_BYTES (up to about 1,260 species), otherwise sent to
+    the parent in blocks as they are made (stats.StreamedCounts, "counts"):
+    the dense object is 0.93 GiB at 5,000 species, in every worker. The HOG
+    pass (write_hog_tree) counts none, they are not used.
     """
     n_writers = len(non_hog_queues)
     worker_pid = os.getpid()
-    n_ortho_acc = stats.NOrthoSp(nspecies)
+    if write_hog_tree:
+        n_ortho_acc = None
+    elif stats.NOrthoSp.n_bytes(nspecies) <= WORKER_DENSE_COUNT_BYTES:
+        n_ortho_acc = stats.NOrthoSp(nspecies)
+    else:
+        n_ortho_acc = stats.StreamedCounts(lambda block: progress_queue.put(("counts", block)))
     # The OGs with nothing for a writer, sent to it in batches (most OGs have
     # nothing for most writers): before this worker's next result for it, so it
     # gets them in order, or once SKIP_BATCH are held, or at the end
@@ -88,6 +117,13 @@ def worker_run_orthologs_method_pipeline(
             send_skips(owner)
             non_hog_queues[owner].put(("result", payload))
 
+    def emit_chunk(iog, olog_texts, sus_texts):
+        # a large tree's rows, as they are made: the writers hold them on disk
+        for owner, payload in partition_chunk(olog_texts, sus_texts, n_writers).items():
+            if chunk_budget is not None:
+                chunk_budget.acquire(chunk_size(payload))
+            non_hog_queues[owner].put(("chunk", iog, payload))
+
     while True:
         try:
             iog = args_queue.get(True, 0.1)
@@ -96,7 +132,11 @@ def worker_run_orthologs_method_pipeline(
                 break
 
             progress_queue.put(("start", worker_pid, iog))
-            result = tree_analyser.analyse_tree(iog, n_ortho_acc=n_ortho_acc)
+            result = tree_analyser.analyse_tree(
+                iog,
+                n_ortho_acc=n_ortho_acc,
+                emit_chunk=emit_chunk if need_ortholog_output else None,
+            )
 
             if result is None:
                 hog_queue.put(("skip", iog))
@@ -141,7 +181,10 @@ def worker_run_orthologs_method_pipeline(
     for owner, writer_queue in enumerate(non_hog_queues):
         send_skips(owner)
         writer_queue.put(None)
-    progress_queue.put(("worker_done", worker_pid, n_ortho_acc))
+    if isinstance(n_ortho_acc, stats.StreamedCounts):
+        n_ortho_acc.flush()     # (before "worker_done": the parent has all its counts by then)
+        n_ortho_acc = None
+    progress_queue.put(("worker_done", worker_pid, n_ortho_acc, tree_analyser.polytomies))
 
 
 @parallel_task_manager.frozen_while_running
@@ -212,6 +255,8 @@ def run_orthologs_parallel_pipeline(
     ]
     progress_queue = mp.Queue(maxsize=max(4 * n_processes, 32))
     writer_status_queue = mp.Queue()
+    chunk_budget = parallel_task_manager.ByteBudget(
+        system_info.memory_budget(CHUNKS_IN_FLIGHT_BYTES, CHUNKS_IN_FLIGHT_FRACTION))
 
     for _ in range(n_processes):
         args_queue.put(None)
@@ -240,6 +285,7 @@ def run_orthologs_parallel_pipeline(
                 n_writer_processes,
                 iogs_ordered,
                 spill_dir,
+                chunk_budget,
             )
         )
         for writer_id in range(n_writer_processes)
@@ -258,6 +304,7 @@ def run_orthologs_parallel_pipeline(
                 output_writer.need_ortholog_output,
                 n_orthologs_cache,
                 write_hog_tree,
+                chunk_budget,
             )
         )
         for _ in range(n_processes)
@@ -274,7 +321,8 @@ def run_orthologs_parallel_pipeline(
     progressbar, task = printing.get_progressbar(total_tasks)
     progressbar.start()
 
-    n_orthologs_sp_pair = stats.NOrthoSp(nspecies)
+    # (the HOG pass counts none: write_hog_tree)
+    n_orthologs_sp_pair = None if write_hog_tree else stats.NOrthoSp(nspecies)
     errors = []   # error text for the WorkerError raised at the end
 
     def report_error(text):
@@ -311,10 +359,15 @@ def run_orthologs_parallel_pipeline(
                 pass
 
             elif isinstance(msg, tuple) and msg[0] == "worker_done":
-                _, worker_pid, worker_counts = msg
+                _, worker_pid, worker_counts, worker_polytomies = msg
                 finished_worker_pids.add(worker_pid)
                 active_workers = n_processes - len(finished_worker_pids)
-                n_orthologs_sp_pair += worker_counts
+                if worker_counts is not None:
+                    n_orthologs_sp_pair += worker_counts
+                tree_analyser.polytomies.extend(worker_polytomies)
+
+            elif isinstance(msg, tuple) and msg[0] == "counts":
+                n_orthologs_sp_pair.add_block(msg[1])
 
             elif isinstance(msg, tuple) and msg[0] == "start":
                 _, worker_pid, iog = msg

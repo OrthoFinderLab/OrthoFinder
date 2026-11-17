@@ -178,7 +178,8 @@ class WaterfallMethod:
                     bij = WaterfallMethod.normalise_scores(
                         bij, lengths, i_species, j_species
                     )
-                bi.append(bij)
+                # (held as CompactCSR: no row pointer for each gene of each pair)
+                bi.append(matrices.compact(bij))
             matrices.dump_matrix_array("B", bi, i_species, d_pickle)
             BH = WaterfallMethod.get_bh_s(bi, seqs_info, i_species)
             matrices.dump_matrix_array("BH", BH, i_species, d_pickle)
@@ -289,10 +290,10 @@ class WaterfallMethod:
             m, has = WaterfallMethod._row_max(W)
             update = has & (m > best_hit_for_sequence)
             best_hit_for_sequence[update] = m[update]
-            H[j] = WaterfallMethod._entries_above(W, m - tol)
+            H[j] = matrices.compact(WaterfallMethod._entries_above(W, m - tol))
         # now look for paralogs
         W = pairwise_scores_matrices[i_species].tocsr()
-        H[i_species] = WaterfallMethod._entries_above(W, best_hit_for_sequence - tol)
+        H[i_species] = matrices.compact(WaterfallMethod._entries_above(W, best_hit_for_sequence - tol))
         return H
 
     @staticmethod
@@ -394,13 +395,13 @@ class WaterfallMethod:
             np.zeros(seqs_info.n_seqs_per_species[seqs_info.species_to_use[i_spec]])
         )
         for k_spec in range(seqs_info.n_species):
-            B[k_spec] = B[k_spec].tocsr()
             if i_spec == k_spec:
                 continue
-            best_hit = np.maximum(best_hit, matrices.sparse_max_row(B[k_spec]))
-            I, J = RBH[k_spec].nonzero()
+            b = matrices.as_csr(B[k_spec])      # (a block at a time as CSR)
+            best_hit = np.maximum(best_hit, matrices.sparse_max_row(b))
+            I, J = matrices.as_csr(RBH[k_spec]).nonzero()
             if len(I) > 0:
-                most_distant[I] = np.minimum(B[k_spec][I, J], most_distant[I])
+                most_distant[I] = np.minimum(b[I, J], most_distant[I])
         # anything that doesn't have an RBB, set to distance to the closest gene in another species. I.e. it will hit just that gene and all genes closer to it in the its own species
         I = most_distant > 1e8
         most_distant[I] = (
@@ -434,13 +435,12 @@ class WaterfallMethod:
         """
         # 1. Reduce to column vectors
         q_debug_gather = False
-        RBH = [rbh.tocsr() for rbh in RBH]
-        B = [b.tocsr() for b in B]
-        RBH_B = [
-            sparse.csr_matrix(rbh.multiply(b))
+        # (a block at a time as CSR: not every block of the species' row at once)
+        RBH_B = (
+            sparse.csr_matrix(matrices.as_csr(rbh).multiply(matrices.as_csr(b)))
             for i, (rbh, b) in enumerate(zip(RBH, B))
             if i != i_spec
-        ]
+        )
         # create a vector of these scores
         nseqi = seqs_info.n_seqs_per_species[seqs_info.species_to_use[i_spec]]
 
@@ -490,26 +490,26 @@ class WaterfallMethod:
         )
         j_conversion = 0
         for k_spec in range(seqs_info.n_species):
-            B[k_spec] = B[k_spec].tocsr()
             if i_spec == k_spec:
                 continue
+            b = matrices.as_csr(B[k_spec])
             species_factor_to_most_distant = C[0, j_conversion]
             if q_debug_gather:
                 print(species_factor_to_most_distant)
             j_conversion += 1
-            best_hit = np.maximum(best_hit, matrices.sparse_max_row(B[k_spec]))
-            I, J = RBH[k_spec].nonzero()
+            best_hit = np.maximum(best_hit, matrices.sparse_max_row(b))
+            I, J = matrices.as_csr(RBH[k_spec]).nonzero()
             if len(I) > 0:
                 if q_debug_gather:
                     print(
                         "%d updated"
                         % np.count_nonzero(
-                            species_factor_to_most_distant * B[k_spec][I, J]
+                            species_factor_to_most_distant * b[I, J]
                             < most_distant[I]
                         )
                     )
                 most_distant[I] = np.minimum(
-                    species_factor_to_most_distant * B[k_spec][I, J], most_distant[I]
+                    species_factor_to_most_distant * b[I, J], most_distant[I]
                 )
         # anything that doesn't have an RBB, set to distance to the closest gene in another species. I.e. it will hit just that gene and all genes closer to it in the its own species
         I = most_distant > 1e8
@@ -559,7 +559,7 @@ class WaterfallMethod:
                 np.ones(int(keep.sum())), rows[keep], M.indices[keep],
                 (n_seqs_i, seqs_info.n_seqs_per_species[seqs_info.species_to_use[j_spec]]),
             )
-            connect.append(mat)
+            connect.append(matrices.compact(mat))
         return connect
 
     @staticmethod

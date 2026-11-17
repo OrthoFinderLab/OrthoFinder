@@ -187,6 +187,24 @@ def print_citation(d=None):
     )
 
 
+def report_warnings(stage, lines, summary):
+    """
+    Warnings of many items: a line each in checkpoint.txt (under the stage, with
+    the run's other messages), and their summary to the screen and Log.txt.
+    """
+    from . import file_handler
+    for line in lines:
+        run_logging.RunLogger.step(stage, "WARNING: " + line)
+    print("WARNING: " + summary)
+    file_handler.handler.write_to_log("\nWARNING: " + summary + "\n")
+
+
+def report_notes(stage, lines):
+    """Notes of many items, not warnings: a line each in checkpoint.txt (under the stage), nothing to the screen."""
+    for line in lines:
+        run_logging.RunLogger.step(stage, line)
+
+
 def print_underline(text, q_heavy=False):
     run_logging.RunLogger.message(text)
     n = len(text)

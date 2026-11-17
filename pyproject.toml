@@ -43,7 +43,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13", # tested
     "Programming Language :: Python :: 3.14", # tested
 ]
-dependencies = ["numpy", "scipy", "scikit-learn", "biopython", "rich", "ete4", "pandas>=2.0"]
+dependencies = ["numpy", "scipy", "scikit-learn", "biopython", "rich", "ete4", "pandas>=2.0", "clipkit"]
 
 [project.urls]
 repository = "https://github.com/OrthoFinder/OrthoFinder"
@@ -73,7 +73,10 @@ convert_orthofinder_tree_ids = "tools.convert_orthofinder_tree_ids:main"
 create_hog_fastas = "tools.create_hog_fastas:main"
 ncbi_primary_transcript = "tools.ncbi_primary_transcript:main"
 orthogroup_gene_count = "tools.orthogroup_gene_count:main"
+trim_msa = "tools.trim_msa:main"
 split_ortholog_files = "tools.split_ortholog_files:main"
+species_overlaps = "tools.species_overlaps:main"
+expand_polytomies = "tools.expand_polytomies:main"
 # preview (not in the released OrthoFinder: PREVIEW_OPTIONS in src/orthofinder/run/cli_options.py)
 view_results = "tools.view_results.view_results:main"
 # /preview

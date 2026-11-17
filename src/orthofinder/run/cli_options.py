@@ -87,6 +87,13 @@ METHOD_OPTIONS = {
         {"names": ("-T", "--tree-program"), "value": "txt", "read": "tree",
          "help": 'Tree inference method, requires [dark_cyan]"-M msa"[/dark_cyan] [Default = [dark_cyan]FastTree[/dark_cyan]]',
          "choices": lambda pc: [m for m in pc.list_tree_methods() if m != "raxml-ng"]},
+        {"names": ("--trim",), "value": "txt", "read": "trim",
+         "help": 'MSA trimming program, requires [dark_cyan]"-M msa"[/dark_cyan]. '
+                 f"[dark_cyan]orthofinder[/dark_cyan] for {OF}'s own trimming, "
+                 '[dark_cyan]none[/dark_cyan] for no trimming, as [dark_cyan]-z[/dark_cyan] '
+                 "[Default = [deep_sky_blue2]clipkit[/deep_sky_blue2], kpic mode for "
+                 "[deep_sky_blue2]1000[/deep_sky_blue2] or more sequences]",
+         "choices": lambda pc: ["orthofinder"] + pc.list_trim_methods() + ["none"]},
         {"names": ("-ST", "--species-tree-program"), "value": "txt", "read": "species_tree_program",
          "help": 'Species tree program, from the gene trees, requires [dark_cyan]"-M msa"[/dark_cyan] '
                  "[Default = a tree of the concatenated alignment of single-copy orthogroups, or "
@@ -133,6 +140,9 @@ OUTPUT_OPTIONS = {
                  "([dark_cyan]-og[/dark_cyan], [dark_cyan]-ogt[/dark_cyan], [dark_cyan]-ost[/dark_cyan]) "
                  "or if the run fails",
          "preview_help": " (with [dark_cyan]--orthoxml[/dark_cyan] also " + _path("MCL_Orthogroups.orthoxml") + ")"},
+        {"names": ("--keep-dropped",), "set": {"keep_dropped": True},
+         "help": "Also save the columns that trimming removed from each MSA, in " +
+                 _path("MultipleSequenceAlignments_Dropped/") + " (the same file names as the MSAs)"},
     ],
 }
 
@@ -189,9 +199,8 @@ OTHER_OPTIONS = {
     "options": [
         {"names": ("-y",), "set": {"q_split_para_clades": True},
          "help": "Split paralogous clades below root of a HOG into separate HOGs"},
-        {"names": ("-z",), "set": {"q_trim": False},
-         "help": "Don't trim MSAs (columns>=[deep_sky_blue2]90[/deep_sky_blue2]% gap, min. alignment length "
-                 "[deep_sky_blue2]500[/deep_sky_blue2])"},
+        {"names": ("-z",), "set": {"q_trim": False, "no_trim_given": True},
+         "help": "Don't trim MSAs, the same as [dark_cyan]--trim none[/dark_cyan]"},
         {"names": ("--matrix",), "preview": True, "value": "txt", "read": "scoring",
          "help": "Scoring matrix of the [dark_cyan]DIAMOND[/dark_cyan] searches [Default = [dark_cyan]BLOSUM62[/dark_cyan]]",
          "choices": lambda pc: list(diamond_scoring.DIAMOND_MATRICES)},

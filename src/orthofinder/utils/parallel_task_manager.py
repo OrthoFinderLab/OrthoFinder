@@ -205,6 +205,37 @@ def frozen_for_fork():
                 gc.unfreeze()
 
 
+class ByteBudget(object):
+    """
+    The memory of the data in flight between processes, shared by those that
+    make it (acquire, before) and those that write it (release, once
+    written), e.g. the orthogroups read and not yet written (update_trees),
+    a large tree's ortholog rows (parallel_pipeline). An item larger than the
+    limit goes ahead when nothing else is in flight. acquire gives up (False)
+    once stop_event, if given, is set.
+    """
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = mp.Value("q", 0, lock=False)
+        self.cond = mp.Condition()
+
+    def acquire(self, n, stop_event=None):
+        with self.cond:
+            while self.used.value > 0 and self.used.value + n > self.limit:
+                if stop_event is not None and stop_event.is_set():
+                    return False
+                self.cond.wait(1.0)
+            self.used.value += n
+        return True
+
+    def release(self, n):
+        if n:
+            with self.cond:
+                self.used.value -= n
+                self.cond.notify_all()
+
+
 def print_time(message):
     run_logging.RunLogger.message(message)
     printing.printer.print((str(datetime.datetime.now()).rsplit(".", 1)[0] + " : " + message), style="default")

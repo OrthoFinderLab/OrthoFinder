@@ -646,6 +646,20 @@ class _FileHandler(object):
     
     def get_align_id_dir(self):
         return os.path.join(self.wd_current,  "Alignments_ids/")
+
+    def get_align_dropped_id_dir(self):
+        """The columns trimming removed from each alignment (--keep-dropped), with the gene IDs."""
+        return os.path.join(self.wd_current, "Alignments_dropped_ids/")
+
+    def get_align_dropped_fn(self, i_og):
+        """(The directory is made once, before the alignments: msa_trees.do_trees)"""
+        return self.get_align_dropped_id_dir() + (self.base_og_format % i_og) + ".fa"
+
+    def get_results_align_dropped_dir(self):
+        """--keep-dropped: the columns trimming removed from each MSA of MultipleSequenceAlignments/."""
+        d = os.path.join(self.rd1, "MultipleSequenceAlignments_Dropped/")
+        os.makedirs(d, exist_ok=True)
+        return d
         
     def get_results_trees_dir(self):
         # return self.rd1 + "Gene_Trees/"
@@ -997,8 +1011,10 @@ class _FileHandler(object):
         species removed), and the sequence files there would be used for it.
         """
         for d in (self.rd1 + "Orthogroup_Sequences/", self.rd1 + "Single_Copy_Ortholog_Sequences/",
-                  self.rd1 + "MultipleSequenceAlignments/", self.wd_current + "Sequences_ids/",
-                  self.wd_current + "Alignments_ids/", self.wd_current + "Trees_ids/",
+                  self.rd1 + "MultipleSequenceAlignments/", self.rd1 + "MultipleSequenceAlignments_Dropped/",
+                  self.wd_current + "Sequences_ids/",
+                  self.wd_current + "Alignments_ids/", self.wd_current + "Alignments_dropped_ids/",
+                  self.wd_current + "Trees_ids/",
                   self.wd_current + "Gene_Trees/", self.wd_current + "Distances/",
                   self.wd_current + "Resolved_Gene_Trees_ids/"):
             if os.path.isdir(d):

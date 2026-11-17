@@ -567,6 +567,7 @@ class OrthoFinderTestFuncs:
             
             for h, row in cached_hogs:
                 if h not in ["N0.ids", "N0"]:
+                    row = hog_writer.dense_row(row)
                     hogs = tuple(
                         # frozenset(re.split(r"[,\s;]+", item.rsplit("_", 1)[0].strip()))
                         frozenset(re.split(r"[,\s;]+", item.strip()))

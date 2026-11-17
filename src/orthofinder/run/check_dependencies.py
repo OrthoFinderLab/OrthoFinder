@@ -241,37 +241,71 @@ def _method_test(result):
     return success, cmd, None
 
 
-def can_run_species_tree_program(prog_caller, program, commands=None):
-    """Whether the species tree program (-ST) runs, on a few small gene trees."""
-    if program not in prog_caller.list_species_tree_methods():
+def _can_run_configured_program(program, what, program_type, configured, test, commands=None):
+    """
+    Whether a program of config.json (of program_type, one of configured)
+    passes its test, test(the test directory) -> a ProgramCaller test's
+    result; what: how the errors name it. Its commands are added to commands.
+    """
+    if program not in configured:
         # e.g. restored for a restart, from a config file no longer given
-        printer.print('ERROR: The species tree program "%s" is not configured (program_type "species_tree" in '
-                      'config.json or a file given with --config)\n' % program, style="error")
+        printer.print('ERROR: The %s "%s" is not configured (program_type "%s" in '
+                      'config.json or a file given with --config)\n' % (what, program, program_type), style="error")
         return False
     d_deps_test = file_handler.handler.get_dependencies_check_dir()
-    success, cmd, _ = run_test(lambda: _method_test(
-        prog_caller.test_species_tree_method(program, d_deps_test, method_threads="2")))
+    success, cmd, _ = run_test(lambda: _method_test(test(d_deps_test)))
     if cmd is None:   # not tested: "skip_check" in its config entry
         return True
     if success:
         if commands is not None:
-            commands.append(cmd)
+            commands.extend(cmd.split("\n"))
         return True
-    printer.print("ERROR: Cannot run %s" % program, style="error")
-    prog_caller.print_dependency_check_failure(cmd)
+    printer.print("ERROR: Cannot run the %s %s" % (what, program), style="error")
+    program_caller.ProgramCaller.print_dependency_check_failure(cmd)
     printer.print("Please check %s is installed and that the executables are in the system path\n" % program, style="error")
     return False
+
+
+def can_run_species_tree_program(prog_caller, program, commands=None):
+    """Whether the species tree program (-ST) runs, on a few small gene trees."""
+    return _can_run_configured_program(
+        program, "species tree program", "species_tree", prog_caller.list_species_tree_methods(),
+        lambda d_test: prog_caller.test_species_tree_method(program, d_test, method_threads="2"), commands)
+
+
+def runs_gene_trees(options):
+    """Whether the analysis makes the alignments and gene trees (not stopped before, or started after, them)."""
+    return not (options.q_stop_after_prepare or options.q_stop_after_mcl_groups
+                or options.q_start_from_trees or options.q_start_from_species_trees)
 
 
 def species_tree_program_to_check(options, q_assign):
     """The species tree program the analysis will run (-ST, or for --assign ASTRAL-Pro), or None."""
     if q_assign:
         return process_args.assign_species_tree_program(options)
-    q_species_tree = not (options.q_stop_after_prepare or options.q_stop_after_mcl_groups
-                          or options.q_start_from_trees or options.q_start_from_species_trees or options.species_tree_fn)
-    if options.species_tree_program is not None and options.q_msa_trees and q_species_tree:
+    if (options.species_tree_program is not None and options.q_msa_trees and runs_gene_trees(options)
+            and not options.species_tree_fn):
         return options.species_tree_program
     return None
+
+
+def trim_program_to_check(options, q_assign):
+    """The trimming program (--trim) the analysis will run, or None (OrthoFinder's own trimming, or none)."""
+    if not (options.q_msa_trees and options.q_trim and options.trim_program):
+        return None
+    return options.trim_program if q_assign or runs_gene_trees(options) else None
+
+
+def can_run_trim_program(prog_caller, program, keep_dropped, commands=None, nucleotide=False):
+    """
+    Whether the trimming program (--trim) trims a test alignment, of nucleotides
+    if nucleotide (-d) (and writes the columns it removes, keep_dropped).
+    """
+    return _can_run_configured_program(
+        program, "trimming program", "trim", prog_caller.list_trim_methods(),
+        lambda d_test: prog_caller.test_trim_method(program, d_test, keep_dropped=keep_dropped, nucleotide=nucleotide),
+        commands)
+
 
 def check_dependencies(options, user_specified_m, prog_caller, dir_for_temp_files, q_assign=False,
                        recorded_programs=None):
@@ -319,6 +353,10 @@ def _check_dependencies(options, user_specified_m, prog_caller, dir_for_temp_fil
             util.fail()
     species_tree_program = species_tree_program_to_check(options, q_assign)
     if species_tree_program is not None and not can_run_species_tree_program(prog_caller, species_tree_program, commands):
+        util.fail()
+    trim_program = trim_program_to_check(options, q_assign)
+    if trim_program is not None and not can_run_trim_program(prog_caller, trim_program, options.keep_dropped, commands,
+                                                             nucleotide=options.dna):
         util.fail()
     used = record_programs(commands, file_handler.handler.rd1)
     warn_changed_programs(recorded_programs, used)
