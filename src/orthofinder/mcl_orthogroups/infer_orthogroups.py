@@ -303,6 +303,30 @@ def add_unclustered_genes(ogs, species_to_use, n_seqs_per_species):
     return len(missing)
 
 
+def write_orthogroup_sequences(species_info_obj, options, ogs=None):
+    """
+    The FASTA file of each orthogroup in the working directory (Sequences_ids/,
+    with the gene IDs), those not there already: of the orthogroups of the
+    run's clusters file, or ogs if given (in memory, --assign). Not
+    Orthogroup_Sequences/: the MCL orthogroups' sequences (e.g. -og) are
+    written by tools/mcl_orthogroup_sequences.py.
+    """
+    og_set = orthogroups_set.OrthogroupSet(
+        options.min_seq,
+        file_handler.handler.get_working_directory1_read(),
+        species_info_obj.species_to_use,
+        species_info_obj.n_sp_all,
+        options.q_add_species_to_ids,
+        options.tree_program,
+        id_extractor=gene_ids.FirstWordExtractor,
+        ogs=ogs,
+    )
+    os.makedirs(file_handler.handler.get_seqs_id_dir(), exist_ok=True)
+    msa_trees.TreesForOrthogroups(None, None, None).write_fasta_files(
+        file_handler.handler.get_species_seqs_dir(), species_info_obj.species_to_use,
+        og_set.get_ogs_all(), None, q_id=True, q_results=False, n_processes=options.n_process_alg or 1)
+
+
 def post_clustering_orthogroups(
         clusters_filename_pairs,
         species_info_obj,
@@ -330,7 +354,7 @@ def post_clustering_orthogroups(
         add_unclustered_genes(ogs, species_info_obj.species_to_use, seqs_info.n_seqs_per_species)
 
     printing.print_underline("Writing orthogroups to file")
-    ids_dict = mcl.MCL.write_orthogroup_files(
+    mcl.MCL.write_orthogroup_files(
         ogs,
         [file_handler.handler.get_sequence_ids_fn()],
         None,
@@ -340,35 +364,7 @@ def post_clustering_orthogroups(
     )
 
     # Write Orthogroup FASTA files
-    og_set = orthogroups_set.OrthogroupSet(
-        options.min_seq,
-        file_handler.handler.get_working_directory1_read(),
-        species_info_obj.species_to_use,
-        species_info_obj.n_sp_all,
-        options.q_add_species_to_ids,
-        options.tree_program,
-        id_extractor=gene_ids.FirstWordExtractor,
-        ogs=ogs_given,
-    )
-
-
-    tree_gen = msa_trees.TreesForOrthogroups(None, None, None)
-
-    # d_seqs = files.FileHandler.get_results_seqs_dir()
-    # if not os.path.exists(d_seqs):
-    #     os.mkdir(d_seqs)
-
-    # treeGen.write_fasta_files(fastaWriter, ogSet.get_ogs_all(), idsDict, False)
-
-    d_seqs_id = file_handler.handler.get_seqs_id_dir()
-    if not os.path.exists(d_seqs_id):
-        os.mkdir(d_seqs_id)
-
-    # Not Orthogroup_Sequences/: the MCL orthogroups' sequences (e.g. -og) are written by
-    # tools/mcl_orthogroup_sequences.py
-    tree_gen.write_fasta_files(file_handler.handler.get_species_seqs_dir(), species_info_obj.species_to_use,
-                               og_set.get_ogs_all(), ids_dict, q_id=True, q_results=False,
-                               n_processes=options.n_process_alg or 1)
+    write_orthogroup_sequences(species_info_obj, options, ogs=ogs_given)
 
     if not q_incremental:
         # stats.Stats(ogs, speciesNamesDict, speciesInfoObj.speciesToUse, files.FileHandler.iResultsVersion)

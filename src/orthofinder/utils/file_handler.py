@@ -1019,6 +1019,11 @@ class _FileHandler(object):
                   self.wd_current + "Resolved_Gene_Trees_ids/"):
             if os.path.isdir(d):
                 shutil.rmtree(d)
+        # the profiles of the orthogroups that --assign made from this analysis (named by
+        # their numbers), which it reuses if they are there
+        for fn in glob.glob(self.wd_current + "profile_sequences*"):
+            if os.path.isfile(fn):
+                os.remove(fn)
 
     def get_orthogroup_results_fn_base(self):
         if self.rd1 == None:

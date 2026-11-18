@@ -604,6 +604,27 @@ class PreviousFilesLocatorNew(PreviousFilesLocator):
         return chain
 
 
+def given_clusters_file(fn):
+    """An orthogroups file given to -fg (clusters_OrthoFinder_*.txt_id_pairs.txt), as an absolute path."""
+    name = os.path.basename(fn)
+    if "clusters_OrthoFinder_" not in name or not name.endswith("txt_id_pairs.txt"):
+        print("ERROR:\n    %s\nis neither a directory or a clusters_OrthoFinder_*.txt_id_pairs.txt file." % fn)
+        util.fail()
+    return os.path.abspath(fn)
+
+
+def other_orthogroups(continuation_dir, results_dir, state):
+    """
+    Whether -fg was given an orthogroups file other than the one the run
+    recorded (its files of each orthogroup are of that one, under the same
+    numbers): then they are to be removed, and made again.
+    """
+    if not os.path.isfile(continuation_dir):
+        return False
+    recorded = run_state.file(results_dir, state, "orthogroups") if results_dir else None
+    return recorded is None or not os.path.samefile(recorded, continuation_dir)
+
+
 class PreviousFilesLocatorState(PreviousFilesLocator):
     """
     The files of a results directory from its run_state.json (see run_state):
@@ -629,6 +650,9 @@ class PreviousFilesLocatorState(PreviousFilesLocator):
         self.wd_base_prev = dirs["base"]
         self.wd_trees = dirs.get("trees") or self.wd_base_prev[0]
         self.clusters_filename_pairs = run_state.file(results_dir, state, "orthogroups")
+        if options.q_start_from_groups and os.path.isfile(continuation_dir):
+            # -fg given an orthogroups file: those orthogroups, not the ones recorded
+            self.clusters_filename_pairs = given_clusters_file(continuation_dir)
         self.species_ids_lines = state.get("species", {}).get("ids_lines")
         self.species_tree_rooted_ids_fn = os.path.join(self.wd_trees, "SpeciesTree_rooted_ids.txt")
         self.species_tree_unrooted_ids_fn = os.path.join(self.wd_trees, "SpeciesTree_unrooted_ids.txt")
@@ -637,11 +661,18 @@ class PreviousFilesLocatorState(PreviousFilesLocator):
 class PreviousFilesLocatorOld(PreviousFilesLocator):
     def __init__(self, options, continuation_dir):
         PreviousFilesLocator.__init__(self)
+        # -fg given an orthogroups file: its results are rooted at its working directory's
+        clusters_file = continuation_dir if os.path.isfile(continuation_dir) else None
+        if clusters_file is not None:
+            continuation_dir = os.path.dirname(os.path.abspath(clusters_file))
         continuation_dir = paths.as_dir(continuation_dir)
         self.home_for_results = continuation_dir + "OrthoFinder/"
         if options.q_start_from_groups or options.q_start_from_trees:
             # User can specify it using clusters_id_pairs file, process this first to get the workingDirectory
-            ogs_dir = os.path.abspath(continuation_dir + "../" if options.q_start_from_trees else continuation_dir)
+            if clusters_file is not None:
+                ogs_dir = clusters_file
+            else:
+                ogs_dir = os.path.abspath(continuation_dir + "../" if options.q_start_from_trees else continuation_dir)
 
             self.wd_base_prev, self.orthofinder_results_dir, self.clusters_filename_pairs = self._get_ogs_file(ogs_dir)
             if options.q_start_from_trees:

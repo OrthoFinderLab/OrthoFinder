@@ -40,6 +40,7 @@ def start_run(ctx, args, input_args):
     # so that what follows (e.g. "-S blast" as blastn or blastp) and what is
     # reported and recorded agree with the settings the restart runs with.
     i_og_restart_state = 0
+    q_other_orthogroups = False
     state = {}
     state_dir = None  # the results directory of state, for its paths
     changed = []
@@ -52,6 +53,11 @@ def start_run(ctx, args, input_args):
             # Log.txt records, read before this run rewrites it
             state = previous_run.state_from_log(continuation_dir)
         i_og_restart_state = state.get("assign", {}).get("i_og_restart", 0)
+        q_other_orthogroups = options.q_start_from_groups and previous_run.other_orthogroups(
+            continuation_dir, state_dir, state)
+        if q_other_orthogroups:
+            # (the trees kept from an --assign run are of its own orthogroups)
+            i_og_restart_state = 0
         changed = run_state.restore_settings(state, options, input_args, results_dir=state_dir)
         # the run's search program (restored above, or the same as the default)
         options.search_program_from_run = ("search_program" in state.get("settings", {})
@@ -77,6 +83,10 @@ def start_run(ctx, args, input_args):
         results_dir_non_default,
         pickle_dir_non_default,
     )
+    if q_other_orthogroups:
+        # -fg given other orthogroups than the run's: its files of each orthogroup
+        # (sequences, alignments, trees) are of other genes under the same numbers
+        file_handler.handler.remove_orthogroup_files()
     if diamond_scoring.is_custom_matrix(options.score_matrix):
         # searched with a copy in the working directory, kept with the results
         options.score_matrix = diamond_scoring.copy_custom_matrix(

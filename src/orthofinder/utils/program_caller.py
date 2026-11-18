@@ -1093,7 +1093,7 @@ class ProgramCaller(object):
         print("export PATH=%s:" % parallel_task_manager.my_env["PATH"])
         print(programs.with_paths(cmd))
         print("\nOrthoFinder looks for the programs it runs in: %s." % parallel_task_manager.PROGRAM_DIRS_TEXT)
-        print("To install them: in a conda environment (recommended: conda install -c bioconda orthofinder, "
+        print("To install them: in a conda environment (recommended: conda install -c conda-forge -c bioconda orthofinder, "
               "or the program on its own), with 'make install_tools' in the OrthoFinder directory (installs "
               "to ~/local/bin), or anywhere on your PATH.")
         print(

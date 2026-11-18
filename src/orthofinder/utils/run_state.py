@@ -119,10 +119,12 @@ def _resolve(results_dir, recorded):
 def find(continuation_dir):
     """
     The results directory of a directory given to a restart option (the
-    results directory, or its WorkingDirectory) and its state: (results_dir,
+    results directory, its WorkingDirectory, or a clusters file there) and its state: (results_dir,
     state), or (None, {}) if it has no run_state.json.
     """
     d = os.path.abspath(continuation_dir)
+    if os.path.isfile(d):
+        d = os.path.dirname(d)      # (an orthogroups file, -fg: in the working directory)
     for results_dir in (d, os.path.dirname(d)):
         if os.path.exists(state_path(results_dir)):
             return _results_dir(results_dir), read(results_dir)

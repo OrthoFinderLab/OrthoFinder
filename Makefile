@@ -456,7 +456,7 @@ create_conda_env: check_conda
 		conda env remove -n $(ENV_NAME) -y || { echo "Error: Failed to remove the conda environment $(ENV_NAME)."; exit 1; }
 	fi
 	echo "Creating the conda environment $(ENV_NAME) with Python $(CONDA_PYTHON_VERSION)..."
-	conda create -n $(ENV_NAME) python=$(CONDA_PYTHON_VERSION) -y || { echo "Error: Failed to create the conda environment $(ENV_NAME)."; exit 1; }
+	conda create -n $(ENV_NAME) -c conda-forge python=$(CONDA_PYTHON_VERSION) -y || { echo "Error: Failed to create the conda environment $(ENV_NAME)."; exit 1; }
 
 # $(call conda_install,<bioconda package>,<name>,<command>,<version>)
 define conda_install
@@ -467,7 +467,7 @@ fi
 echo "Installing $(2) $(or $(4),(the latest version)) in the conda environment $(ENV_NAME)..."
 . "$$(conda info --base)/etc/profile.d/conda.sh"
 conda activate $(ENV_NAME)
-conda install -y bioconda::$(1)$(if $(4),=$(4)) || { echo "Error: Failed to install $(2)."; exit 1; }
+conda install -y -c conda-forge -c bioconda bioconda::$(1)$(if $(4),=$(4)) || { echo "Error: Failed to install $(2)."; exit 1; }
 endef
 
 conda_install_diamond: create_conda_env

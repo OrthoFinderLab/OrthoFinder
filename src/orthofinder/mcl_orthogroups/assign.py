@@ -1,6 +1,7 @@
 import glob
 import os
 import random
+import re
 import tempfile
 from collections import defaultdict
 from typing import Optional
@@ -19,6 +20,7 @@ from ..utils import util, file_handler, parallel_task_manager, fasta_processor, 
 from ..search import runner
 from . import orthogroups_set
 from ..utils import printing
+from ..utils import run_state
 
 
 class AssignConfig(object):
@@ -236,9 +238,21 @@ def core_clusters_file(wd):
     if not fns:
         print("ERROR: Couldn't find the orthogroups (clusters_OrthoFinder_*_id_pairs.txt) in %s" % wd)
         util.fail()
-    if len(fns) > 1:
-        print("WARNING: Found multiple orthogroup files, using the first: %s" % fns)
-    return fns[0]
+    if len(fns) == 1:
+        return fns[0]
+    # Several (the orthogroups inferred again in the same results, -b): those the
+    # analysis used, as its run_state.json records them, which its files of each
+    # orthogroup (sequences, alignments, trees) are of. The others are of other
+    # orthogroups under the same numbers (the first by name is usually the oldest).
+    results_dir, state = run_state.find(wd)
+    recorded = run_state.file(results_dir, state, "orthogroups") if results_dir else None
+    if recorded is not None:
+        for fn in fns:
+            if os.path.exists(fn) and os.path.samefile(fn, recorded):
+                return fn
+    latest = max(fns, key=os.path.getmtime)
+    print("WARNING: Found multiple orthogroup files, using the most recent: %s (of %s)" % (latest, fns))
+    return latest
 
 
 def get_original_orthogroups():
@@ -296,7 +310,12 @@ def write_all_orthogroups(ogs, ogs_new_species, ogs_clade_specific_lists, restar
     positions of everything after them, so if restart_index is given, the
     adjusted value is returned as well: (clusters filename, restart index).
     Without the adjustment the first clade-specific orthogroups would be
-    skipped (no trees, no HOGs) and their genes reported as unassigned.
+    skipped (no trees, no HOGs) and their genes reported as unassigned. It is
+    also at most the first removed position: the gene tree files of the
+    first pass are named by the positions before this call, so from there on
+    they are of other orthogroups (remove_gene_tree_files), and the
+    orthogroups need theirs again (issue #99: an orthogroup's genes written
+    twice, from a tree of a clade-specific orthogroup's number).
     """
     for iog, genes in ogs_new_species.items():
         ogs[iog].update(genes)
@@ -307,7 +326,8 @@ def write_all_orthogroups(ogs, ogs_new_species, ogs_clade_specific_lists, restar
     assigned_genes = {gene for og in ogs if len(og) > 1 for gene in og}
     keep = [len(og) != 1 or og.isdisjoint(assigned_genes) for og in ogs]
     if restart_index is not None:
-        restart_index = sum(keep[:restart_index])
+        first_removed = next((i for i, k in enumerate(keep) if not k), len(keep))
+        restart_index = min(sum(keep[:restart_index]), first_removed)
     ogs[:] = [og for og, k in zip(ogs, keep) if k]
 
     clusters_filename_pairs = None
@@ -317,6 +337,38 @@ def write_all_orthogroups(ogs, ogs_new_species, ogs_clade_specific_lists, restar
     if restart_index is None:
         return clusters_filename_pairs
     return clusters_filename_pairs, restart_index
+
+
+# The files of the working directory named by an orthogroup's position (OG<i>...)
+_OG_FILE_RE = re.compile(r"^OG(\d{7})\b")
+
+
+def gene_tree_dirs():
+    """The working directory's directories of files named by an orthogroup's position: its sequences, alignments and trees."""
+    h = file_handler.handler
+    return [h.get_seqs_id_dir(), h.get_align_id_dir(), h.get_align_dropped_id_dir(), h.get_ogs_tree_dir(),
+            h.get_ogs_tree_dir(q_results=True), os.path.join(h.wd_current, "Distances")]
+
+
+def remove_gene_tree_files(start, dirs=None):
+    """
+    The files of the orthogroups from position start on removed from dirs
+    (default gene_tree_dirs()), as they would be kept otherwise (a file that
+    exists is not written again): those of the first pass of --assign are of
+    the positions before single-gene orthogroups were removed
+    (write_all_orthogroups). Returns the number removed.
+    """
+    n = 0
+    for d in (gene_tree_dirs() if dirs is None else dirs):
+        if not os.path.isdir(d):
+            continue
+        with os.scandir(d) as entries:
+            for entry in entries:
+                m = _OG_FILE_RE.match(entry.name)
+                if m and int(m.group(1)) >= start and entry.is_file():
+                    os.remove(entry.path)
+                    n += 1
+    return n
 
 
 def _profile_genes_for_chunk(args):

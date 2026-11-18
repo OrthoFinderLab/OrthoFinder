@@ -784,13 +784,13 @@ orthofinder -fg ExampleData/OrthoFinder/Results_og_only/</code></pre>
 <p>If you installed OrthoFinder with conda, you shouldn't need to install any of the programs it runs. The programs bundled with OrthoFinder (in the <code>linux-intel</code> release and the source code) are built for Linux on Intel/AMD (x86-64) processors only, including WSL2 on Windows. On other systems, such as macOS or computers with ARM processors (e.g. Apple silicon), install them yourself, for example with conda. Otherwise, the default analysis needs DIAMOND, MCL, FAMSA and FastTree (and ASTRAL-Pro for <code>--assign</code>).</p>
 <table class="wide">
   <tr><th>Program</th><th>Needed for</th><th>Installation</th></tr>
-  <tr><td>DIAMOND (<a href="#s2-1">2.1</a>)</td><td>sequence search (default)</td><td><code>conda install -c bioconda diamond</code>, or <a href="https://github.com/bbuchfink/diamond/wiki/2.-Installation">github.com/bbuchfink/diamond</a></td></tr>
-  <tr><td>MCL</td><td>orthogroups</td><td><code>conda install -c bioconda mcl</code>, or <a href="https://github.com/micans/mcl">github.com/micans/mcl</a></td></tr>
-  <tr><td>FAMSA</td><td>alignments (default)</td><td><code>conda install -c bioconda famsa</code>, or <a href="https://github.com/refresh-bio/FAMSA">github.com/refresh-bio/FAMSA</a></td></tr>
-  <tr><td>FastTree</td><td>gene and species trees (default)</td><td><code>conda install -c bioconda fasttree</code>, or <a href="http://www.microbesonline.org/fasttree/#Install">microbesonline.org/fasttree</a></td></tr>
+  <tr><td>DIAMOND (<a href="#s2-1">2.1</a>)</td><td>sequence search (default)</td><td><code>conda install -c conda-forge -c bioconda diamond</code>, or <a href="https://github.com/bbuchfink/diamond/wiki/2.-Installation">github.com/bbuchfink/diamond</a></td></tr>
+  <tr><td>MCL</td><td>orthogroups</td><td><code>conda install -c conda-forge -c bioconda mcl</code>, or <a href="https://github.com/micans/mcl">github.com/micans/mcl</a></td></tr>
+  <tr><td>FAMSA</td><td>alignments (default)</td><td><code>conda install -c conda-forge -c bioconda famsa</code>, or <a href="https://github.com/refresh-bio/FAMSA">github.com/refresh-bio/FAMSA</a></td></tr>
+  <tr><td>FastTree</td><td>gene and species trees (default)</td><td><code>conda install -c conda-forge -c bioconda fasttree</code>, or <a href="http://www.microbesonline.org/fasttree/#Install">microbesonline.org/fasttree</a></td></tr>
   <tr><td>ASTRAL-Pro</td><td><code>--assign</code>, <code>-ST astral-pro</code></td><td><a href="https://github.com/chaoszhang/ASTER">github.com/chaoszhang/ASTER</a> (bundled with OrthoFinder)</td></tr>
-  <tr><td>MAFFT</td><td><code>-A mafft</code></td><td><code>conda install -c bioconda mafft</code>, or <a href="https://mafft.cbrc.jp/alignment/software/source.html">mafft.cbrc.jp</a></td></tr>
-  <tr><td>BLAST+, MMseqs2, MUSCLE, RAxML, IQ-TREE</td><td><code>-S</code>, <code>-A</code>, <code>-T</code> alternatives</td><td><code>conda install -c bioconda blast mmseqs2 muscle raxml iqtree</code></td></tr>
+  <tr><td>MAFFT</td><td><code>-A mafft</code></td><td><code>conda install -c conda-forge -c bioconda mafft</code>, or <a href="https://mafft.cbrc.jp/alignment/software/source.html">mafft.cbrc.jp</a></td></tr>
+  <tr><td>BLAST+, MMseqs2, MUSCLE, RAxML, IQ-TREE</td><td><code>-S</code>, <code>-A</code>, <code>-T</code> alternatives</td><td><code>conda install -c conda-forge -c bioconda blast mmseqs2 muscle raxml iqtree</code></td></tr>
 </table>
 </section>
 

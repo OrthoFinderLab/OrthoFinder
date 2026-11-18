@@ -371,6 +371,10 @@ def run_assign(ctx):
     #     infer_orthogroups.post_clustering_orthogroups(clustersFilename_pairs, speciesInfoObj, seqsInfo, speciesNamesDict, options, speciesXML=None)
     if orphan_genes_version == 2:
         # v2 - Infer rooted species tree from new rooted gene trees, identify new species-clades & search within these
+        if assign_resume and assign_state.get("i_og_restart") is not None:
+            # The run being continued renumbered the orthogroups (below): its files from
+            # there on are of the final numbering, not of the first pass's
+            assign.remove_gene_tree_files(int(assign_state["i_og_restart"]))
         with ctx.step("Infer clade-specific orthogroups"):
             clusters_filename_pairs, i_og_restart = between_core_orthogroups_workflow(
                 continuation_dir,
@@ -384,6 +388,11 @@ def run_assign(ctx):
                 results_layout=results_layout,
                 only_missing=assign_resume,
             )
+        # The gene tree files of the first pass from i_og_restart on are of other
+        # orthogroups (write_all_orthogroups): removed, to be made again. Recorded
+        # first, before a file of the final numbering is written, for a restart.
+        run_state.update(results_dir, "assign", i_og_restart=i_og_restart)
+        assign.remove_gene_tree_files(i_og_restart)
 
         # Infer clade-specific orthogroup gene trees
         infer_orthogroups.post_clustering_orthogroups(

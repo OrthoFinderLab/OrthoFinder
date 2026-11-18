@@ -207,6 +207,9 @@ def from_groups(ctx):
     # infer_orthogroups.do_orthogroups(
     #     options, speciesInfoObj, seqsInfo, speciesNamesDict, speciesXML
     # )
+    # the orthogroups' sequence files, if missing: removed when -fg is given other
+    # orthogroups than the run's (start.py), whose files they were
+    infer_orthogroups.write_orthogroup_sequences(species_info_obj, options)
 
     get_orthologs(
         seqs_info,

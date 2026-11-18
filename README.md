@@ -12,6 +12,7 @@ OrthoFinder identifies orthogroups, infers gene trees for all orthogroups, and a
 
 ## Table of contents
 
+- [What's new in v3.2.1](#whats-new-in-v321)
 - [What's new in v3.2](#whats-new-in-v32)
 - [Installation](#installation)
 - [Simple Usage](#simple-usage)
@@ -25,6 +26,22 @@ OrthoFinder identifies orthogroups, infers gene trees for all orthogroups, and a
 - [System Requirements](#system-requirements)
 
 For more information please visit [our website](https://orthofinder.github.io/OrthoFinder/).
+
+## What's new in v3.2.1
+
+These changes are in OrthoFinder v3.2.1 and later. The first two change the results, so please check them if you have scripts that read OrthoFinder results.
+
+1. **ClipKIT trims the alignments by default.** Before the gene trees are inferred, each multiple sequence alignment is trimmed with [ClipKIT](https://github.com/JLSteenwyk/ClipKIT) (its kpic mode for alignments of 1000 or more sequences). ClipKIT is installed with OrthoFinder. `--trim` chooses another trimming program from the config file (e.g. `trimal` or `bmge`), `--trim orthofinder` the trimming of earlier versions, and `--trim none` (or `-z`) no trimming. If the trimming program fails, removes every column or leaves a sequence without residues, the alignment is used untrimmed. `--keep-dropped` also saves the columns that were removed, in `MultipleSequenceAlignments_Dropped/`. The new `trim_msa` tool trims an alignment the same way, outside a run.
+
+2. **The orthologs of a polytomy are written one row per pair of species sets.** A polytomy is a gene tree node with more than two children, e.g. of many identical sequences. Its orthologs were written one row for each pair of children, and a polytomy of 50,000 identical sequences would have billions of rows. Now the children of the same species are written together, e.g. `A1, A2, A3` against `B1, B2`. The gene pairs and the counts are the same. Every polytomy is listed in `Resolved_Gene_Trees/Polytomies.tsv` (its orthogroup and node, its children, genes and species, and its ortholog pairs), with a summary in `WorkingDirectory/checkpoint.txt`. The `expand_polytomies <Results_dir>` tool writes a copy of the ortholog files with a row for each pair of children, as before.
+
+3. **The `species_overlaps` tool** writes the number of orthogroups shared by each pair of species (`Comparative_Genomics_Statistics/Orthogroups_SpeciesOverlaps.tsv`, which a run no longer writes), as `species_overlaps <Results_dir>`. It can also count the HOGs of a species tree node, e.g. `species_overlaps Phylogenetic_Hierarchical_Orthogroups/N1.tsv`.
+
+4. **Fixes**
+   - `--assign` wrote some orthogroups twice in `Orthogroups.tsv` and left their genes out of others ([#99](https://github.com/OrthoFinder/OrthoFinder/issues/99)). This was in v3.2 only.
+   - `--assign` on a core run whose orthogroups had been inferred again (`-b` with another `-I`) could use the old orthogroups, and the sequence profiles of the old ones.
+   - `-fg` given an orthogroups file (`WorkingDirectory/clusters_OrthoFinder_*.txt_id_pairs.txt`) instead of a results directory failed.
+   - The Bioconda package of v3.2 missed the `brotli-python` package that ete4 needs, so `orthofinder -h` stopped with `No module named 'brotli'` ([#94](https://github.com/OrthoFinder/OrthoFinder/issues/94)).
 
 ## What's new in v3.2
 
@@ -77,10 +94,13 @@ These changes are in OrthoFinder v3.2 and later. Some of them change the names a
 The simplest way to install OrthoFinder is through [conda](https://anaconda.org/bioconda/orthofinder). If you're unfamiliar with conda, [this tutorial](https://www.machinelearningplus.com/deployment/conda-create-environment-and-everything-you-need-to-know-to-manage-conda-virtual-environment/) offers a beginner-friendly introduction.
 
 ```bash
-conda create -n of3_env python=3.12
+conda create -n of3_env -c conda-forge -c bioconda python=3.12 orthofinder
 conda activate of3_env
-conda install orthofinder
 ```
+
+OrthoFinder is on the Bioconda channel, and the programs and Python packages it needs are on conda-forge, so both channels are given. A plain `conda install orthofinder` looks only in the default channel and fails with `PackagesNotFoundError`.
+
+If `orthofinder -h` then stops with the error `No module named 'brotli'`, install the missing module with `conda install -c conda-forge brotli-python`.
 
 Alternatively, you could install via github, or download the source code and install locally.
 
@@ -231,6 +251,7 @@ Command-line options for OrthoFinder
   | `-S`      | Sequence search program. `blast` is BLAST+ for either kind of input, `blastp` for protein sequences or `blastn` with `-d` (nucleotide sequences) | `diamond` (`blastn` with `-d`) | `diamond`, `diamond_ultra_sens`, `blast`, `blastp`, `blastn`, `mmseqs` |
   | `-A`      | MSA program, requires `-M msa`            | `famsa`   | `famsa`, `mafft`, `muscle`                                                           |
   | `-T`      | Tree inference method, requires `-M msa`  | `fasttree`| `fasttree`, `fasttree_fastest`, `raxml`, `iqtree`                               |
+  | `--trim`  | MSA trimming program, requires `-M msa`. `orthofinder` is the trimming of earlier versions | `clipkit` (kpic mode for 1000 or more sequences) | `clipkit`, `clipkit-kpic-smart-gap`, `trimal`, `bmge`, `bmge-dna`, `orthofinder`, `none` |
   | `-ST`     | Species tree program, from the gene trees, requires `-M msa` | a tree of the concatenated alignment, or `astral-pro` with `--assign` | `astral-pro` |
   | `-I`      | MCL inflation parameter                   | `1.2`     | usually `1.2`–`5` (larger values give smaller orthogroups, see the [MCL manual](https://micans.org/mcl/man/mcl.html)) |
 
@@ -271,6 +292,7 @@ Command-line options for OrthoFinder
   | `-o <txt>`      | Specify a non-default results directory.                                    |
   | `-pof`    | Save the pairwise ortholog files. With many species (a file for each pair, n × (n−1) files), we recommend running without it and then making only the files you need with the `split_ortholog_files` tool (`--species`, `--partners`, `-t`), as `split_ortholog_files <Results_dir>`, or `python tools/split_ortholog_files.py <Results_dir>` from the source code without installing OrthoFinder. |
   | `-mog` | Also keep the MCL orthogroups (before the HOGs) in a full run, as `Orthogroups/MCL_Orthogroups.tsv` etc. They are always written with `-og`, `-ogt` or `-ost`, or if the run fails. |
+  | `--keep-dropped` | Also save the columns that trimming removed from each MSA, in `MultipleSequenceAlignments_Dropped/` (the same file names as the MSAs). |
 
 <!-- preview -->
 - **OrthoXML output**<br>
@@ -407,9 +429,11 @@ OrthoFinder extends its phylogenetic approach to orthogroups, defining orthogrou
 
 **```/Comparative_Genomics_Statistics```**
 - Files containing summary statistics across all orthogroups, as well as comparisons between each pair of species.
+- The number of orthogroups shared by each pair of species (`Orthogroups_SpeciesOverlaps.tsv`) is no longer written by a run. `species_overlaps <Results_dir>` writes it.
 
 **```/Resolved_Gene_Trees```**
 - A rooted phylogenetic tree inferred for each orthogroup with 4 or more sequences and resolved using the OrthoFinder hybrid species-overlap/duplication-loss coalescent model.
+- `Polytomies.tsv` lists each polytomy of the resolved gene trees (a node with more than two children), with its orthogroup, children, genes, species and ortholog pairs. The orthologs of a polytomy are written one row per pair of the species sets of its children. `expand_polytomies <Results_dir>` writes them one row per pair of children.
 
 **```/Species_Tree```**
 - `SpeciesTree_rooted.txt` is a species tree inferred using STAG or ASTRAL-Pro.

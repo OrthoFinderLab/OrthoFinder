@@ -44,12 +44,13 @@ To install via conda, we first need to install miniconda. Follow the instruction
 We then need to run these commands.
 
 ```
-conda config --add channels defaults conda config --add channels bioconda conda config
---add channels conda-forge
-conda create -n orthofinder
-conda activate orthofinder
-conda install orthofinder
+conda create -n of3_env -c conda-forge -c bioconda python=3.12 orthofinder
+conda activate of3_env
 ```
+
+OrthoFinder is on the Bioconda channel, and the programs and Python packages it needs are on
+conda-forge, so both channels are given. If `orthofinder -h` then stops with the error
+`No module named 'brotli'`, install the missing module with `conda install -c conda-forge brotli-python`.
 
 If you are on one of the newer Macs with the new chips (M1/M2/M3), you might need to
 follow a few extra steps to use conda. Check out the guide [here](https://towardsdatascience.com/how-to-manage-conda-environments-on-an-applesilicon-
