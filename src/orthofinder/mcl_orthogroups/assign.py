@@ -20,7 +20,7 @@ from ..utils import util, file_handler, parallel_task_manager, fasta_processor, 
 from ..search import runner
 from . import orthogroups_set
 from ..utils import printing
-from ..utils import run_state
+from ..utils import run_state, run_report
 
 
 class AssignConfig(object):
@@ -515,6 +515,7 @@ def create_profiles_database(
     ids = og_set.spec_seq_dict()
     ids_rev = {v: k for k, v in ids.items()}
     if q_hogs:
+        run_report.checked("assign.mcl_fallback")
         try:
             ids_simple = og_set.sequence_dict()
             ids_simple_rev = {v: k for k, v in ids_simple.items()}
@@ -525,6 +526,7 @@ def create_profiles_database(
             )
             q_hogs = False
             print("WARNING: Using MCL-based orthogroups as a fall-back")
+            run_report.add("assign.mcl_fallback", "N0.tsv", detail="the HOGs file could not be read")
             # util.Fail()
     if not q_hogs:
         ogs = mcl.get_predicted_ogs(core_clusters_file(wd))

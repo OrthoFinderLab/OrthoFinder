@@ -2,7 +2,7 @@ from . import convert, update_trees
 import os
 import itertools
 
-from ..utils import file_handler, util, file_io
+from ..utils import file_handler, util, file_io, run_report
 from ..utils import paths
 
 def update_output_files(
@@ -96,6 +96,7 @@ def update_output_files(
     # }
 
     hog_index = build_hog_index(unique_ogs, hog_n0_over4genes)
+    run_report.checked("hog.tree_not_made", len(hog_n0_over4genes))
 
     update_trees.post_ogs_processing(
         unique_ogs,

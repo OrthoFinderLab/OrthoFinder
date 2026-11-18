@@ -428,6 +428,9 @@ def restore_settings(state, options, args, names=None, results_dir=None):
     if "astral" in saved and "species_tree_program" not in saved:
         # runs before -ST named a configured program: ASTRAL-Pro or the default
         saved["species_tree_program"] = "astral-pro" if saved["astral"] else None
+    if "q_trim" in saved and "trim_program" not in saved:
+        # runs before --trim (v3.2 and earlier): OrthoFinder's own trimming, not ClipKIT
+        saved["trim_program"] = None
     changed = []
     for name, flags in SETTINGS:
         if names is not None and name not in names:

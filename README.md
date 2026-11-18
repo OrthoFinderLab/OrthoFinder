@@ -33,11 +33,13 @@ These changes are in OrthoFinder v3.2.1 and later. The first two change the resu
 
 1. **ClipKIT trims the alignments by default.** Before the gene trees are inferred, each multiple sequence alignment is trimmed with [ClipKIT](https://github.com/JLSteenwyk/ClipKIT) (its kpic mode for alignments of 1000 or more sequences). ClipKIT is installed with OrthoFinder. `--trim` chooses another trimming program from the config file (e.g. `trimal` or `bmge`), `--trim orthofinder` the trimming of earlier versions, and `--trim none` (or `-z`) no trimming. If the trimming program fails, removes every column or leaves a sequence without residues, the alignment is used untrimmed. `--keep-dropped` also saves the columns that were removed, in `MultipleSequenceAlignments_Dropped/`. The new `trim_msa` tool trims an alignment the same way, outside a run.
 
-2. **The orthologs of a polytomy are written one row per pair of species sets.** A polytomy is a gene tree node with more than two children, e.g. of many identical sequences. Its orthologs were written one row for each pair of children, and a polytomy of 50,000 identical sequences would have billions of rows. Now the children of the same species are written together, e.g. `A1, A2, A3` against `B1, B2`. The gene pairs and the counts are the same. Every polytomy is listed in `Resolved_Gene_Trees/Polytomies.tsv` (its orthogroup and node, its children, genes and species, and its ortholog pairs), with a summary in `WorkingDirectory/checkpoint.txt`. The `expand_polytomies <Results_dir>` tool writes a copy of the ortholog files with a row for each pair of children, as before.
+2. **The orthologs of a polytomy are written one row per pair of species sets.** A polytomy is a gene tree node with more than two children, e.g. of many identical sequences. Its orthologs were written one row for each pair of children, and a polytomy of 50,000 identical sequences would have billions of rows. Now the children of the same species are written together, e.g. `A1, A2, A3` against `B1, B2`. The gene pairs and the counts are the same. A polytomy with a child of several species, e.g. `((A1,X1),B1,A2,(B2,X2))`, is resolved instead, with the species tree and few duplications, as earlier versions could call orthologs for it that no gene tree would give (here A2 with B1 and B2, but A1 with B1 only). This changes the results only of such polytomies, which FastTree's trees rarely have. Every polytomy is listed in `Resolved_Gene_Trees/Polytomies.tsv` (its orthogroup and node, its children, genes and species, whether it was resolved, and its ortholog pairs), with a summary in `WorkingDirectory/checkpoint.txt`. The `expand_polytomies <Results_dir>` tool writes a copy of the ortholog files with a row for each pair of children, as before.
 
 3. **The `species_overlaps` tool** writes the number of orthogroups shared by each pair of species (`Comparative_Genomics_Statistics/Orthogroups_SpeciesOverlaps.tsv`, which a run no longer writes), as `species_overlaps <Results_dir>`. It can also count the HOGs of a species tree node, e.g. `species_overlaps Phylogenetic_Hierarchical_Orthogroups/N1.tsv`.
 
-4. **Fixes**
+4. **A run report**, in `WorkingDirectory/Run_Report/`. `Summary.tsv` lists every check of each stage of the run (the input files, the sequence searches, the orthogroups, the alignments, the gene trees, the species tree, the HOGs, the orthologs and the output files), with what it found, out of how many, its severity (results missing, results changed or information) and its effect on the results. A check that found nothing shows 0, and a check the run did not do (e.g. a stage a restart did not run again) keeps the count of the run it continues. The items a check found, e.g. the orthogroups whose gene trees were missing or could not be analysed, are listed in a file of the stage, e.g. `Gene_Trees.tsv`, written only if there are any. If some results are missing, the end of the run says so in one line, also in `Log.txt`. Gene trees that could not be analysed were left out silently before. The lists of ignored files, renamed genes and unreadable trees that were printed on the screen are now in the report, with a line on the screen.
+
+5. **Fixes**
    - `--assign` wrote some orthogroups twice in `Orthogroups.tsv` and left their genes out of others ([#99](https://github.com/OrthoFinder/OrthoFinder/issues/99)). This was in v3.2 only.
    - `--assign` on a core run whose orthogroups had been inferred again (`-b` with another `-I`) could use the old orthogroups, and the sequence profiles of the old ones.
    - `-fg` given an orthogroups file (`WorkingDirectory/clusters_OrthoFinder_*.txt_id_pairs.txt`) instead of a results directory failed.
@@ -433,7 +435,7 @@ OrthoFinder extends its phylogenetic approach to orthogroups, defining orthogrou
 
 **```/Resolved_Gene_Trees```**
 - A rooted phylogenetic tree inferred for each orthogroup with 4 or more sequences and resolved using the OrthoFinder hybrid species-overlap/duplication-loss coalescent model.
-- `Polytomies.tsv` lists each polytomy of the resolved gene trees (a node with more than two children), with its orthogroup, children, genes, species and ortholog pairs. The orthologs of a polytomy are written one row per pair of the species sets of its children. `expand_polytomies <Results_dir>` writes them one row per pair of children.
+- `Polytomies.tsv` lists each polytomy of the gene trees (a node with more than two children), with its orthogroup, children, genes, species and ortholog pairs. The orthologs of a polytomy are written one row per pair of the species sets of its children. `expand_polytomies <Results_dir>` writes them one row per pair of children. A polytomy with a child of several species is resolved with the species tree (its event is `resolved`), and its orthologs are written as for any other node.
 
 **```/Species_Tree```**
 - `SpeciesTree_rooted.txt` is a species tree inferred using STAG or ASTRAL-Pro.
@@ -445,6 +447,9 @@ OrthoFinder extends its phylogenetic approach to orthogroups, defining orthogrou
 
 **```/Orthogroup_Sequences```**
 - A FASTA file for each orthogroup giving the amino acid sequences for each gene in the orthogroup.
+
+**```/WorkingDirectory/Run_Report```**
+- `Summary.tsv` lists every check of the run, by stage, with the number of problems found, out of how many, their severity and their effect on the results. If a check found any, the file of its stage (e.g. `Gene_Trees.tsv`) lists them, an orthogroup, file or species a line, with the details.
 
 
 ## Citation

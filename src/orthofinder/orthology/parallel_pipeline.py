@@ -567,12 +567,7 @@ def run_orthologs_parallel_pipeline(
         output_writer.hog_writer.i_hog.clear()
         output_writer.hog_writer.i_hog.update(hog_counts)
 
-    skip_rate = skipped_tasks / max(1, total_tasks)
-    if skip_rate > 0.02:
-        print(
-            "WARNING: skipped %d/%d tasks (%.1f%%)." %
-            (skipped_tasks, total_tasks, 100.0 * skip_rate)
-        )
+    # (the trees skipped, and why: in the run report, TreeAnalyser.report_skipped)
 
     if not fatal and not hog_done:
         report_error("ERROR: ordered HOG writer did not finish cleanly.")

@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from . import file_io
+from . import file_io, run_report
 
 # The characters a name cannot hold, each replaced by "_": whitespace and control
 # characters (a tab or line break would split a cell or line of the tab-separated
@@ -121,6 +121,8 @@ def prefixes_if_shared(names, species_names_dict, species_to_use, q_add_species_
         if last_names is names and last_species == species and last_q == q_add_species_to_ids:
             return prefixes
     shared = shared_names(names, species)
+    # (a count, not each name: with isolates of a species, most of their names)
+    run_report.count("input.shared_names", len(shared), len(names))
     prefixes = None
     if shared:
         examples = ", ".join(shared[:5]) + (", ..." if len(shared) > 5 else "")

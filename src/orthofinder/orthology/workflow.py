@@ -43,7 +43,7 @@ from ..mcl_orthogroups import orthogroups_set
 from . import stats
 
 from ..hog_orthogroups import finalise
-from ..utils import printing
+from ..utils import printing, run_report
 from ..utils import gene_ids
 from ..utils import paths
 from ..phylo import taxa
@@ -426,6 +426,10 @@ def root_species_tree(
         for r in roots: 
             print(("  " + (", ".join([sp_dict[s] for s in r]))  ))
         q_multiple = len(roots) > 1
+        run_report.checked("st.multiple_roots")
+        if q_multiple:
+            for r in roots:
+                run_report.add("st.multiple_roots", ", ".join(sp_dict[s] for s in r), detail="an outgroup")
     shutil.copy(rooted_species_tree_fn[0], file_handler.handler.get_species_tree_ids_rooted_fn())
 
     """

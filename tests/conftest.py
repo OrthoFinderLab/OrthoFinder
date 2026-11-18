@@ -1,5 +1,8 @@
 import os
 import sys
+# (before OrthoFinder is imported) an unexpected error analysing a gene tree fails the test,
+# rather than the run going on without the tree (as for users, in the run report)
+os.environ["ORTHOFINDER_RAISE_INTERNAL_ERRORS"] = "1"
 import pytest
 import copy
 from collections import deque 

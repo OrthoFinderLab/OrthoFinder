@@ -411,6 +411,17 @@ def test_restart_continues_the_trimming_but_not_keep_dropped():
     assert not options.keep_dropped                 # an extra output: only if given again
 
 
+def test_restart_of_a_run_before_trim_programs():
+    # (v3.2: no trim_program in its state) its own trimming, not the new default
+    from orthofinder.utils import run_state
+    options = process_args.Options()
+    run_state.restore_settings({"settings": {"q_trim": True}}, options, ["-fg", "Results"])
+    assert options.trim_program is None
+    options = process_args.Options()
+    run_state.restore_settings({"settings": {"q_trim": True}}, options, ["-fg", "Results", "--trim", "clipkit"])
+    assert options.trim_program == "clipkit"
+
+
 def test_restart_of_a_dendroblast_run_with_trim_rejected(tmp_path):
     # -M of the run being continued is restored after the options are read
     from orthofinder.utils import run_state
@@ -535,6 +546,8 @@ def test_trimming_warnings_summarised(tmp_path, monkeypatch, capsys):
 
     log = []
     monkeypatch.setattr(file_handler, "handler", Handler())
+    from orthofinder.utils import run_report
+    run_report.start()
     logger = run_logging.Logger(checkpoint, fmt="%(message)s")
     run_logging.RunLogger.set_logger(logger)
     try:
@@ -552,12 +565,15 @@ def test_trimming_warnings_summarised(tmp_path, monkeypatch, capsys):
     assert "1 alignment was trimmed by trimal without the columns removed written" in out
     stage = "[%s] " % msa_trees.TRIMMING_STAGE
     assert checkpoint.read_text() == (
-        stage + "OG0000001.fa a\n" + stage + "OG0000002.fa b\n"
-        + stage + "Trimming with trimal, 6 alignments: 1 trimmed, 1 with every column kept, 3 kept untrimmed (the "
+        stage + "Trimming with trimal, 6 alignments: 1 trimmed, 1 with every column kept, 3 kept untrimmed (the "
         "trimming program failed, removed every column or left a sequence with no residues), 1 not trimmed (10 "
-        "sequences or fewer)\n"
-        + stage + "WARNING: OG0000003.fa trimmed, c\n")
+        "sequences or fewer)\n")
     assert os.listdir(tmp_path) == ["checkpoint.txt"]
+    # (in the run report: all 3 counted, those of 1000 sequences or more listed)
+    assert run_report._state.counts["aln.untrimmed"] == 3
+    assert run_report._state.items["aln.untrimmed"] == [("OG0000001.fa", "", "2000 sequences, a"),
+                                                       ("OG0000002.fa", "", "1000 sequences, b")]
+    assert run_report._state.items["aln.no_dropped"] == [("OG0000003.fa", "", "c")]
 
 
 @pytest.mark.parametrize("dropped_script", [

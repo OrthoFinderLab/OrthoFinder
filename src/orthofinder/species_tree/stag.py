@@ -35,7 +35,7 @@ except ImportError:
     ...
 
 from ..phylo import tree, newick
-from ..utils import util, parallel_task_manager, gene_ids, file_io
+from ..utils import util, parallel_task_manager, gene_ids, file_io, run_report
 from . import consensus_tree as cons
 
 # import tree, newick, util, parallel_task_manager
@@ -173,19 +173,20 @@ def process_trees(dir_in, dir_matrices, dir_trees_out, GeneToSpecies, q_verbose=
     n_success = 0
     n_not_all_present = 0
     n_fail = 0
+    run_report.checked("st.unreadable", len(glob.glob(dir_in + "/*")))
     if q_verbose: print("\nProcessing gene trees:")
     for fn in sorted(glob.glob(dir_in + "/*")):   # (glob lists in no particular order)
         try:
             t = tree.Tree(fn)
         except newick.NewickError:
-            print((os.path.split(fn)[1] + " - WARNING: ETE could not interpret tree file, it will be ignored"))
+            run_report.add("st.unreadable", os.path.split(fn)[1], detail="the tree file could not be read")
             n_fail += 1
             continue
         try:
             genes = t.get_leaf_names()
             species = list(map(GeneToSpecies.to_species, genes))
         except UnrecognisedGene as e:
-            print((os.path.split(fn)[1] + " - WARNING: unrecognised gene, %s" % str(e)))
+            run_report.add("st.unreadable", os.path.split(fn)[1], detail="unrecognised gene, %s" % e)
             n_fail += 1
             continue
         n_this = len(set(species))

@@ -12,7 +12,7 @@ except ImportError:
 from . import util, file_handler as files
 from .printing import printer
 from . import species_info
-from . import gene_ids, file_io
+from . import gene_ids, file_io, run_report
 
 # count = 0 
 
@@ -198,11 +198,14 @@ def processes_new_fasta(
         else:
             excluded_files.append(f)
 
+    run_report.checked("input.not_fasta", len(files_in_directory))
     if len(excluded_files) != 0:
-        print("\nWARNING: Files have been ignored as they don't appear to be FASTA files:")
+        print("\nWARNING: %d %s ignored as not FASTA files (listed in %s). OrthoFinder expects FASTA files to "
+              "have one of the following extensions: %s"
+              % (len(excluded_files), "file was" if len(excluded_files) == 1 else "files were",
+                 os.path.join(run_report.REPORT_DIR, run_report.STAGES["Input"]), ", ".join(fasta_extensions)))
         for f in excluded_files:
-            print(f)
-        print("OrthoFinder expects FASTA files to have one of the following extensions: %s" % (", ".join(fasta_extensions)))
+            run_report.add("input.not_fasta", f, detail="not a FASTA file extension")
     
     species_to_use_prev_names = set(species_to_use_prev_names)
     if len(original_fasta_filenames) + len(species_to_use_prev_names) < 2:
@@ -353,21 +356,24 @@ def processes_new_fasta(
         printer.print("Please check the input file and make sure the gene names are unique.\n", style="error")
         util.fail()
 
+    report_fn = os.path.join(run_report.REPORT_DIR, run_report.STAGES["Input"])
+    run_report.checked("input.not_utf8", len(original_fasta_filenames))
     if not_utf8:
-        printer.print("\nWARNING: The headers of these files are not UTF-8 text: they have been read as "
+        printer.print("\nWARNING: The headers of %d FASTA %s are not UTF-8 text: they have been read as "
                       "Windows-1252 (cp1252) text. Please check the gene names (SequenceIDs.txt), or save the "
-                      "files as UTF-8:", style="warning")
+                      "files as UTF-8 (listed in %s)" % (len(not_utf8), "file" if len(not_utf8) == 1 else "files",
+                                                         escape(report_fn)), style="warning")
         for fasta_filename in not_utf8:
-            printer.print(f"    [orange3]{escape(fasta_filename)}[/orange3]")
-        print()
+            run_report.add("input.not_utf8", fasta_filename, detail="read as Windows-1252")
 
+    run_report.checked("input.renamed")
     if renamed:
-        printer.print("\nWARNING: Some gene names would be the same once the characters a name cannot "
+        printer.print("\nWARNING: %d gene names would be the same as others once the characters a name cannot "
                       "hold (spaces, tabs, : ; ( ) , [ ] = ' \") are replaced by _. These genes have been "
-                      "given distinct names:", style="warning")
+                      "given distinct names (listed in %s)" % (len(renamed), escape(report_fn)), style="warning")
         for fasta_filename, assign, name in renamed:
-            printer.print(f"    {escape(assign)} -> {escape(name)}  [orange3]{escape(fasta_filename)}[/orange3]")
-        print()
+            run_report.add("input.renamed", assign, species=os.path.splitext(fasta_filename)[0],
+                           detail="named %s" % name)
 
     if len(original_fasta_filenames) > 0: output_fasta.close()
     species_info_obj.species_to_use = species_info_obj.species_to_use + new_species_ids

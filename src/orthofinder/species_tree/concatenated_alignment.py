@@ -1,11 +1,12 @@
 """Choosing orthogroups for the species tree and concatenating their alignments."""
 
 import functools
+import os
 from collections import Counter, defaultdict
 
 import numpy as np
 
-from ..utils import printing, util
+from ..utils import printing, util, run_report
 
 try:
     from rich import print
@@ -240,6 +241,7 @@ def create_concatenated_alignment(ogs_to_use_ids, ogs, alignment_filename_functi
     species_names: {species ID: name} to name the rows (by default their species IDs)
     """
     all_species = {str(gene.i_sp) for og in ogs for gene in og}
+    run_report.checked("aln.not_for_species_tree", len(ogs_to_use_ids))
     if q_progress:
         progressbar, task = printing.get_progressbar(len(ogs_to_use_ids))
         progressbar.start()
@@ -254,10 +256,11 @@ def create_concatenated_alignment(ogs_to_use_ids, ogs, alignment_filename_functi
             fn = alignment_filename_function(i_og)
             status, pieces = orthogroup_pieces(fn, selected_seqs, all_species)
             if status == "different lengths":
-                print("WARNING: The sequences of an MSA have different lengths, it is not used for the species tree: %s" % fn)
+                run_report.add("aln.not_for_species_tree", os.path.basename(fn),
+                               detail="its sequences have different lengths")
             elif status == "failed":
-                print("WARNING: An MSA failed for an unknown reason: %s" % fn)
-                print("No tree or orthologs will be inferred for this orthogroup. To correct the issue, identify & correct the problematic gene sequence and rerun.")
+                run_report.add("aln.not_for_species_tree", os.path.basename(fn),
+                               detail="the alignment could not be read (empty or failed)")
             else:
                 for i_sp, al in pieces.items():
                     concatentaed_alignments[i_sp].append(al)

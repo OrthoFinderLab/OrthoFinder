@@ -10,7 +10,8 @@ from collections import Counter
 
 from ..mcl_orthogroups import infer_orthogroups, mcl
 from ..orthology import ortholog_writers
-from ..utils import file_handler, file_io, gene_ids, orthoxml, paths, printing
+from ..utils import file_handler, file_io, gene_ids, orthoxml, paths, printing, run_report
+from ..utils.printing import printer
 from . import previous_run, views
 
 try:
@@ -85,9 +86,11 @@ def clean_up_at_exit(options, q_failed):
                                        or options.q_stop_after_trees or options.q_stop_after_species_trees)
     try:
         if q_failed or stopped:
+            run_report.checked("out.mcl_failed")
             write_mcl_orthogroups(options)
     except Exception as e:
         print("WARNING: The MCL orthogroups could not be written to the results: " + escape(repr(e)))
+        run_report.add("out.mcl_failed", "Orthogroups/MCL_Orthogroups", detail=repr(e))
     try:
         remove_empty_results_dirs()
     except OSError:
@@ -133,12 +136,18 @@ def process_output_files(ctx, species_info_obj, species_names_dict):
 
         if options.orthoxml:
             # --orthoxml (-x): Orthogroups.orthoxml, from the final results files
+            # preview (--orthoxml: not in main)
+            run_report.checked("out.orthoxml_failed")
+            # /preview
             try:
                 species = orthoxml.species_for_analysis(
                     file_handler.handler.get_species_ids_fn(), species_info_obj.species_to_use)
                 orthoxml.write_results(d_results, species)
             except (OSError, KeyError, ValueError) as e:
                 print("WARNING: The orthogroups could not be written in OrthoXML format: " + escape(repr(e)))
+                # preview
+                run_report.add("out.orthoxml_failed", "Orthogroups/Orthogroups.orthoxml", detail=repr(e))
+                # /preview
 
         if options.q_stop_after_mcl_groups:
             # -og stops here (the other stop options and failures: clean_up_at_exit); a full
@@ -156,3 +165,22 @@ def process_output_files(ctx, species_info_obj, species_names_dict):
         else:
             printing.print_run_end(d_results)
         file_handler.handler.write_to_log("OrthoFinder run completed\n", True)
+
+
+def write_run_report():
+    """
+    WorkingDirectory/Run_Report/ (run_report), at the end of every run, and a
+    line on the screen and in Log.txt if results are missing. Never fails: the
+    run's own result (finished, stopped or failed) is kept.
+    """
+    try:
+        lines = run_report.write()
+    except Exception as e:
+        print("WARNING: The run report could not be written: " + escape(repr(e)))
+        return
+    for line in lines or []:
+        printer.print("\n" + escape(line), style="warning")
+        try:
+            file_handler.handler.write_to_log("\n" + line + "\n")
+        except Exception:
+            pass

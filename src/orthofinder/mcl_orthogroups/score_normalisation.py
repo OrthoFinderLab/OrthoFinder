@@ -7,7 +7,7 @@ import warnings
 import numpy.core.numeric as numeric
 from scipy.optimize import curve_fit
 import multiprocessing as mp
-from ..utils import util, file_handler, blast_file_processor, matrices, parallel_task_manager
+from ..utils import util, file_handler, blast_file_processor, matrices, parallel_task_manager, run_report
 
 try:
     import queue
@@ -114,16 +114,13 @@ class WaterfallMethod:
                 B, lengths[i_species], lengths[j_species], fitting_parameters
             )
         elif i_species == j_species and B.nnz == 0:
-            print(
-                "WARNING: THIS IS UNCOMMON, there are zero hits when searching the genes in species %d against itself. Check the input proteome contains all the genes from that species and check the search program is working (default is diamond)."
-                % i_species
-            )
+            # (uncommon: check the proteome has all the species' genes, and the search program works)
+            run_report.add("search.no_self_hits", "", species="%d" % i_species,
+                           detail="no hits of its genes against themselves")
             return sparse.csr_matrix(B.get_shape())
         else:
-            print(
-                "WARNING: Too few hits between species %d and species %d to normalise the scores, these hits will be ignored"
-                % (i_species, j_species)
-            )
+            run_report.add("search.too_few_hits", "",
+                           species="%d, %d" % (i_species, j_species), detail="%d hits" % B.nnz)
             return sparse.csr_matrix(B.get_shape())
 
     @staticmethod
@@ -372,6 +369,8 @@ class WaterfallMethod:
                 (seqs_info, graph_fn, i_spec, file_handler.handler.get_pickle_dir())
                 for i_spec in sorted(range(seqs_info.n_species), key=lambda i: -n_seqs[i])
             ]
+            run_report.checked("search.no_self_hits", seqs_info.n_species)
+            run_report.checked("search.too_few_hits", seqs_info.n_species * seqs_info.n_species)
             parallel_task_manager.parallel_map(func, args, n_process)
             with open(graph_fn, "ab") as graph_file:
                 for i_sp in range(seqs_info.n_species):

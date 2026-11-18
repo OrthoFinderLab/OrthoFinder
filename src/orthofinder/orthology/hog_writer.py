@@ -21,7 +21,7 @@ except ImportError:
     ...
 
 from .ortholog_writers import BufferedFile, LazyFileCache
-from ..utils import util, file_handler, file_io
+from ..utils import util, file_handler, file_io, run_report
 
 
 PY2 = sys.version_info <= (3,)
@@ -431,10 +431,11 @@ class HogWriter(object):
 
 
 
-    def mark_dups_below(self, tree):
+    def mark_dups_below(self, tree, og_name=None):
         """
         Original HOG duplication logic, with one safety fix:
         every internal node always gets dups_below.
+        og_name: a duplication of no single level is in the run report, as of this orthogroup
         """
         for n in tree.traverse("postorder"):
             if n.is_leaf():
@@ -459,6 +460,9 @@ class HogWriter(object):
                         # Do not crash and do not continue.
                         # This node is not a valid evidenced duplication.
                         n.dup = False
+                        if og_name is not None:
+                            run_report.add("hog.topology", og_name,
+                                           detail="node %s, children at %s" % (n.name, ", ".join(map(str, mrcas))))
                     else:
                         n.add_feature("dup_level", l)
                         q_dup_evidenced = True
@@ -527,9 +531,7 @@ class HogWriter(object):
         if len(attested) == 1:
             return attested.pop()
         elif len(attested) == 0:
-            print("WARNING: Unexpected gene tree topology")
-            print(mrcas)
-            # raise Exception()
+            # (in the run report: mark_dups_below)
             return None
         else:
             # Get the highest in the tree: the attested level that is an
@@ -541,9 +543,6 @@ class HogWriter(object):
             for top in attested:
                 if all(self._is_below(str(other), str(top)) for other in attested if other != top):
                     return top
-        print("WARNING: Unexpected gene tree topology 2")
-        print(mrcas)
-        # raise Exception()
         return None
 
     def dense_row(self, row):

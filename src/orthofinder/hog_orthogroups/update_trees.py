@@ -8,7 +8,7 @@ import ete4
 import tempfile
 import traceback
 import time
-from ..utils import util, parallel_task_manager, system_info
+from ..utils import util, parallel_task_manager, system_info, run_report
 
 
 def write_tree(hog_name, newick_string, resolved_trees_id_dir):
@@ -205,7 +205,7 @@ def read_tree_file(unique_og, tree_file_index, spec_seq_id_dict=None):
             print(f"ERROR reading tree for {unique_og}: {e}")
             raise
     else:
-        print(f"WARNING: Tree file not found for {unique_og}")
+        run_report.add("hog.tree_not_made", unique_og, detail="its gene tree was not found")
     return gene_tree
 
 def read_fasta_file(unique_og, fasta_file_index, exist_msa=True):
@@ -218,7 +218,7 @@ def read_fasta_file(unique_og, fasta_file_index, exist_msa=True):
             raise
     else:
         if exist_msa:
-            print(f"WARNING: FASTA file not found for {unique_og}")
+            run_report.add("hog.tree_not_made", unique_og, detail="its alignment was not found (no HOG alignments)")
     return gene_dict
 
 def _put(q, item, stop_event, timeout=1.0):
@@ -333,6 +333,8 @@ def process_task(
                 else:
                     node = nodes_by_name.get(parent_node)
                     if node is None:
+                        run_report.add("hog.tree_not_made", hog_name,
+                                       detail="node %s not in the gene tree of %s" % (parent_node, unique_og))
                         continue
                     subtree = node.copy()
 
@@ -357,9 +359,11 @@ def process_task(
                     # (the branches of the nodes removed are added to those kept: the
                     # distances between the HOG's genes are those of the gene tree)
                     subtree.prune(valid_leaves, preserve_branch_length=True)
-                except Exception:
+                except Exception as e:
                     if strict_prune_fail:
                         raise
+                    run_report.add("hog.tree_not_made", hog_name,
+                                   detail="pruning the gene tree of %s failed, %s: %s" % (unique_og, type(e).__name__, e))
                     continue
                
                 pruned_alignments = None
@@ -374,9 +378,11 @@ def process_task(
                         pruned_dropped = None
                 try:
                     newick = subtree.write(outfile=None, parser=5)
-                except Exception:
+                except Exception as e:
                     if strict_prune_fail:
                         raise
+                    run_report.add("hog.tree_not_made", hog_name,
+                                   detail="writing its tree failed, %s: %s" % (type(e).__name__, e))
                     continue
                 results.append((hog_name, newick, pruned_alignments, pruned_dropped))
 

@@ -20,6 +20,7 @@ from ..utils import (
     file_io,
     gene_ids,
     printing,
+    run_report,
     run_state,
     species_info,
     util,
@@ -44,6 +45,10 @@ def warn_species_without_assigned_genes(ogs_new_species, species_info_obj, speci
     with_genes = {int(g.split("_", 1)[0]) for genes in ogs_new_species.values() for g in genes}
     missing = [i_sp for i_sp in range(species_info_obj.i_first_new_species, species_info_obj.n_sp_all)
                if i_sp not in with_genes]
+    run_report.checked("assign.no_genes_assigned", species_info_obj.n_sp_all - species_info_obj.i_first_new_species)
+    for i_sp in missing:
+        run_report.add("assign.no_genes_assigned", "", species="%d" % i_sp,
+                       detail="no hits in the search against the orthogroup profiles")
     if missing:
         printer.print(
             "\nWARNING: No genes of these new species were assigned to the core orthogroups (no hits "

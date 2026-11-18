@@ -47,7 +47,7 @@ from ..utils import util, parallel_task_manager
 from ..utils import file_handler
 from . import trim
 from ..species_tree import from_gene_trees
-from ..utils import printing
+from ..utils import printing, run_report
 from ..phylo import taxa
 from ..utils import command_runner
 from ..species_tree.concatenated_alignment import create_concatenated_alignment, determine_orthogroups_for_species_tree
@@ -512,11 +512,11 @@ def trim_commands(trimmer, iog, aln_fn, msa_min_seq, n_seqs):
     return steps
 
 
-# The trimming of a run's alignments, in checkpoint.txt only: a summary line, and a line for
-# each alignment of REPORT_MIN_SEQS sequences or more that the trimming program could not
-# trim (it failed, removed every column or left a sequence with no residues: kept untrimmed).
-# Those trimmed without the columns removed written (--keep-dropped): a line each in
-# checkpoint.txt and a summary to the screen and Log.txt.
+# The trimming of a run's alignments: a summary line in checkpoint.txt, and in the run
+# report the number kept untrimmed (the trimming program failed, removed every column or
+# left a sequence with no residues), with those of REPORT_MIN_SEQS sequences or more listed.
+# Those trimmed without the columns removed written (--keep-dropped): listed in the run
+# report, and a summary to the screen and Log.txt.
 TRIMMING_STAGE = "Build alignments and gene trees"
 REPORT_MIN_SEQS = 1000
 
@@ -527,20 +527,25 @@ def write_trimming_warnings(records, program_name, msa_min_seq=10):
         return
     records = sorted(records, key=lambda r: r[0])
     counts = collections.Counter(r[1] for r in records)
-    printing.report_notes(TRIMMING_STAGE, ["%s %s" % (aln_fn, note) for aln_fn, status, n_seqs, note, _ in records
-                                           if note and status == trim.UNTRIMMED and n_seqs >= REPORT_MIN_SEQS])
+    run_report.count("aln.untrimmed", counts[trim.UNTRIMMED], len(records), add=True)     # (--assign: two batches)
+    for aln_fn, status, n_seqs, note, _ in records:
+        if status == trim.UNTRIMMED and n_seqs >= REPORT_MIN_SEQS:
+            run_report.add("aln.untrimmed", aln_fn, detail="%d sequences, %s" % (n_seqs, note or "kept untrimmed"))
     printing.report_notes(TRIMMING_STAGE, [
         "Trimming with %s, %d alignments: %d trimmed, %d with every column kept, %d kept untrimmed (the trimming "
         "program failed, removed every column or left a sequence with no residues), %d not trimmed (%d sequences "
         "or fewer)" % (program_name, len(records), counts[trim.TRIMMED], counts[trim.ALL_KEPT], counts[trim.UNTRIMMED],
                        counts[trim.FEW], msa_min_seq)])
-    lines = ["%s trimmed, %s" % (aln_fn, warning) for aln_fn, _, _, _, warning in records if warning]
-    if lines:
-        printing.report_warnings(TRIMMING_STAGE, lines,
-                                 "%d %s trimmed by %s without the columns removed written (--keep-dropped). "
-                                 "Details in %s" % (len(lines), "alignment was" if len(lines) == 1 else
-                                                    "alignments were", program_name,
-                                                    file_handler.handler.get_check_point_fn()))
+    warned = [(aln_fn, warning) for aln_fn, _, _, _, warning in records if warning]
+    run_report.checked("aln.no_dropped", len(records), add=True)
+    for aln_fn, warning in warned:
+        run_report.add("aln.no_dropped", aln_fn, detail=warning)
+    if warned:
+        summary = ("%d %s trimmed by %s without the columns removed written (--keep-dropped). Listed in %s"
+                   % (len(warned), "alignment was" if len(warned) == 1 else "alignments were", program_name,
+                      os.path.join(run_report.REPORT_DIR, run_report.STAGES["Alignments"])))
+        print("WARNING: " + summary)
+        file_handler.handler.write_to_log("\nWARNING: " + summary + "\n")
 
 
 """ 

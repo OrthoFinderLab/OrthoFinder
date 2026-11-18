@@ -20,13 +20,22 @@ class RootMap(object):
         else: return None
 
 
-def check_and_root_tree(tree_fn, species_tree_rooted, GeneToSpecies):
+# Why check_and_root_tree gave no tree
+MISSING = "missing or empty"
+ONE_GENE = "one gene"
+NOT_ROOTED = "not rooted"
+
+
+def check_and_root_tree(tree_fn, species_tree_rooted, GeneToSpecies, why=None):
     """
     Check that the tree can be analysed and rooted
     Root tree
     Returns None if this fails, i.e. checks: exists, has more than one gene, can be rooted
+    why: a list, to which the reason is added if it fails (MISSING, ONE_GENE or NOT_ROOTED)
     """
     if (not os.path.exists(tree_fn)) or os.stat(tree_fn).st_size == 0:
+        if why is not None:
+            why.append(MISSING)
         return None, False
     q_have_support = False
     try:
@@ -38,9 +47,13 @@ def check_and_root_tree(tree_fn, species_tree_rooted, GeneToSpecies):
         except:
             tree = tree_lib.Tree(tree_fn, format=3)
     if len(tree) == 1: 
+        if why is not None:
+            why.append(ONE_GENE)
         return None, False
     root = get_root(tree, species_tree_rooted, GeneToSpecies)
     if root == None: 
+        if why is not None:
+            why.append(NOT_ROOTED)
         return None, False
     # Pick the first root for now
     if root != tree:

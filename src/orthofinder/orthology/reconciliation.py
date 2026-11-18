@@ -37,7 +37,7 @@ from .parallel_pipeline import run_orthologs_parallel_pipeline, set_file_descrip
 from .ortholog_writers import ParentOutputWriter
 from ..phylo import tree
 from ..utils import util, file_handler
-from ..utils import printing
+from ..utils import printing, run_report
 from ..utils import species_info
 from ..utils import gene_ids
 from ..phylo import taxa
@@ -254,6 +254,11 @@ def get_all_orthologs(og_set):
     return all_orthologs, nspecies, sp_to_index
 
 
+# The polytomies the first pass resolved (TreeAnalyser.set_hog_pass_resolved),
+# from the end of the first pass to the start of the second
+_hog_pass_resolved = []
+
+
 def do_orthologs_for_ortho_finder(
         og_set,
         species_tree_rooted_labelled,
@@ -324,6 +329,14 @@ def do_orthologs_for_ortho_finder(
             other_names=other_names,
         )
 
+        if not write_hog_tree:
+            ta.set_hog_pass_resolved(list(_hog_pass_resolved))
+            _hog_pass_resolved[:] = []
+        # (the gene trees in the first pass; the orthologs and the results' HOGs in the second)
+        for check in (("tree.missing", "tree.one_gene", "tree.not_rooted", "tree.error", "hog.failed")
+                      if write_hog_tree else ("olog.tree_missing", "olog.error", "hog.failed", "hog.topology")):
+            run_report.checked(check, len(iogs4))
+
         total_tasks = len(iogs4)
 
         if n_parallel == 1:
@@ -393,7 +406,9 @@ def do_orthologs_for_ortho_finder(
                 spill_dir=file_handler.handler.get_working_directory_write(),
             )
 
-        if not write_hog_tree:
+        if write_hog_tree:
+            _hog_pass_resolved[:] = ta.polytomies
+        else:
             write_polytomies(ta.polytomies, file_handler.handler.get_user_resolved_tree_dir())
 
     except IOError as e:

@@ -23,13 +23,18 @@ except ImportError:
     ...
 from ..utils import file_handler, file_io, parallel_task_manager
 from ..utils import printing
+from ..utils import run_report
 from ..phylo import taxa as phylo_taxa
 from . import stats
+from . import rooting
 from .rooting import check_and_root_tree
-from .resolve import resolve_tree
+from .resolve import resolve_tree, resolve_polytomies, RESOLVED
 
 
 debug = False   # HOGs
+# An unexpected error analysing a gene tree: in the run report and the run goes on
+# without it, or (the tests: ORTHOFINDER_RAISE_INTERNAL_ERRORS=1) the run fails
+RAISE_INTERNAL_ERRORS = os.getenv("ORTHOFINDER_RAISE_INTERNAL_ERRORS") == "1"
 
 
 def gene_to_species_dash(g):
@@ -99,6 +104,9 @@ class TreeAnalyser(object):
         # writes the orthologs (not write_hog_tree): this process's, those of the
         # parallel workers added by the parent (write_polytomies)
         self.polytomies = []
+        # The second pass: the polytomies the first resolved, ([(genes, children,
+        # species sets of children)], {gene: index}), set_hog_pass_resolved
+        self.hog_pass_resolved = None
 
 
     def analyse_tree(self, iog, n_ortho_acc=None, emit_chunk=None):
@@ -133,19 +141,21 @@ class TreeAnalyser(object):
             else:
                 tree_file = file_handler.handler.get_resolved_tree_id_dir() + "OG%07d.txt" % iog
 
-            if not os.path.exists(tree_file):
-                return None
-
+            why = []
             rooted_tree_ids, q_have_support = check_and_root_tree(
                 tree_file,
                 self.species_tree_rooted_labelled,
-                self.GeneToSpecies
+                self.GeneToSpecies,
+                why=why,
             )
 
             if rooted_tree_ids is None:
+                self.report_skipped(og_name, tree_file, why[0] if why else rooting.NOT_ROOTED)
                 return None
 
             polytomies = None if self.write_hog_tree else []
+            # (the first pass: those it resolves, recorded in the second)
+            resolved = [] if self.write_hog_tree else None
 
             orthologs, recon_tree, suspect_genes, dups = get_orthologs_from_tree(
                 iog,
@@ -157,6 +167,8 @@ class TreeAnalyser(object):
                 q_no_recon=self.q_no_recon,
                 polytomies=polytomies,
                 q_orthologs=not self.write_hog_tree,     # (the HOG pass: not used)
+                resolved=resolved,
+                hog_pass_resolved=self.hog_pass_resolved,
             )
 
             ortholog_lines = empty_ortholog_lines(self.nspecies)
@@ -187,6 +199,7 @@ class TreeAnalyser(object):
                 recon_tree,
                 self.hog_writer,
                 self.q_split_paralogous_clades,
+                q_report=not self.write_hog_tree,
             )
 
             self.write_resolved_tree(recon_tree, iog)
@@ -196,6 +209,8 @@ class TreeAnalyser(object):
                 pair_counts.add_to(n_ortho_acc)
             if polytomies:
                 self.polytomies.extend(polytomies)
+            if resolved:
+                self.polytomies.extend(resolved)
 
             return {
                 "iog": iog,
@@ -211,8 +226,14 @@ class TreeAnalyser(object):
         except parallel_task_manager.WorkerError:
             raise       # the run cannot write its results (write_resolved_tree)
         except Exception as e:
-            print(str(e))
-            print("WARNING: Unknown error analysing tree %s" % og_name)
+            # (the run goes on without this tree, in the run report; in the tests, an error)
+            if RAISE_INTERNAL_ERRORS:
+                raise
+            if isinstance(e, HogAnalysisError):
+                run_report.add("hog.failed", og_name, detail=str(e))
+            else:
+                run_report.add("tree.error" if self.write_hog_tree else "olog.error", og_name,
+                               detail="%s: %s" % (type(e).__name__, e))
 
             return {
                 "iog": iog,
@@ -226,6 +247,24 @@ class TreeAnalyser(object):
                 "cached_hogs": [],
                 "chunked": False if chunks_sent[0] else None,
             }
+
+    def report_skipped(self, og_name, tree_file, why):
+        """A tree not analysed (why, as check_and_root_tree), in the run report."""
+        if self.write_hog_tree:
+            check = {rooting.MISSING: "tree.missing", rooting.ONE_GENE: "tree.one_gene"}.get(why, "tree.not_rooted")
+        else:
+            check = "olog.tree_missing" if why == rooting.MISSING else "olog.error"
+        run_report.add(check, og_name, detail="%s (%s)" % (why, os.path.basename(tree_file)))
+
+    def set_hog_pass_resolved(self, resolved):
+        """
+        The polytomies the first pass (the HOGs') resolved, (genes, children,
+        species sets of children) each: the second pass reads its trees, so
+        has none to resolve, and records these (by their genes, as the trees'
+        orthogroups are those of the HOGs).
+        """
+        index = {gene: k for k, record in enumerate(resolved) for gene in record[0]}
+        self.hog_pass_resolved = (resolved, index) if resolved else None
 
     def write_resolved_tree(self, recon_tree, iog):
         """
@@ -337,6 +376,8 @@ def get_orthologs_from_tree(
         q_no_recon=False,
         polytomies=None,
         q_orthologs=True,
+        resolved=None,
+        hog_pass_resolved=None,
     ):
     """
     Infer orthologs and duplications from a reconciled gene tree.
@@ -346,6 +387,12 @@ def get_orthologs_from_tree(
 
     polytomies: a list, to which a record is added for each polytomy
     (polytomy_record)
+
+    resolved: a list, to which (genes, children, species sets of children) is
+    added for each polytomy resolved (resolve_polytomies), in the first pass
+
+    hog_pass_resolved: those of the first pass, (records, {gene: index}),
+    recorded in polytomies as the nodes of their genes in this tree
     """
     og_name = "OG%07d" % iog
     q_prune = False
@@ -355,8 +402,15 @@ def get_orthologs_from_tree(
     orthologs = []
     duplications = []
 
+    resolved_polytomies = []
     if not q_no_recon:
+        resolved_polytomies = resolve_polytomies(tree, GeneToSpecies, species_tree_rooted)
         tree = resolve_tree(tree, GeneToSpecies)
+        # (and any that resolve_tree's moves made: the tree the first pass writes,
+        # which the second reads, has none)
+        resolved_polytomies += resolve_polytomies(tree, GeneToSpecies, species_tree_rooted)
+        if resolved is not None:
+            resolved.extend((genes, n_children, n_sets) for _, genes, n_children, n_sets in resolved_polytomies)
 
     if q_prune:
         tree.prune(tree.get_leaf_names())
@@ -492,6 +546,25 @@ def get_orthologs_from_tree(
                                                       "duplication" if q_dup else "speciation",
                                                       entry.n_ortholog_pairs(), species_and_gene))
 
+    if polytomies is not None:
+        records = [(genes, n_children, n_sets, node) for node, genes, n_children, n_sets in resolved_polytomies]
+        if hog_pass_resolved is not None:
+            # (the first pass's, by the genes of each in this tree)
+            hog_records, index = hog_pass_resolved
+            present = defaultdict(list)
+            for gene in tree.get_leaf_names():
+                k = index.get(gene)
+                if k is not None:
+                    present[k].append(gene)
+            records.extend((genes, hog_records[k][1], hog_records[k][2], None)
+                           for k, genes in sorted(present.items()) if len(genes) > 1)
+        for genes, n_children, n_species_sets, node in records:
+            if node is None or node.get_tree_root() is not tree:
+                # (the node of its genes, if not its own: one resolve_tree removed)
+                node = tree.get_common_ancestor(genes)
+            polytomies.append(polytomy_record(og_name, node, n_species_sets, RESOLVED, 0, species_and_gene,
+                                              genes=genes, n_children=n_children))
+
     return orthologs, tree, suspect_genes, duplications
 
 
@@ -586,13 +659,20 @@ POLYTOMIES_HEADER = ("Orthogroup", "Node", "Children", "Genes", "Species", "Max 
                      "Species Sets of Children", "Event", "Ortholog Pairs")
 
 
-def polytomy_record(og_name, node, n_species_sets, event, n_pairs, species_and_gene):
-    """The row of Polytomies.tsv of a polytomy, node (POLYTOMIES_HEADER)."""
+def polytomy_record(og_name, node, n_species_sets, event, n_pairs, species_and_gene, genes=None,
+                    n_children=None):
+    """
+    The row of Polytomies.tsv of a polytomy, node (POLYTOMIES_HEADER). For a
+    polytomy resolved (event RESOLVED, resolve_polytomies), its genes and
+    children, and node the node of its genes in the resolved tree. Its
+    orthologs are rows of binary nodes, so it has no ortholog pairs of its own.
+    """
     per_species = defaultdict(int)
-    for gene in node.get_leaf_names():
+    for gene in (node.get_leaf_names() if genes is None else genes):
         per_species[species_and_gene(gene)[0]] += 1
-    return (og_name, node.name, len(node.get_children()), sum(per_species.values()), len(per_species),
-            max(per_species.values()), n_species_sets, event, n_pairs)
+    return (og_name, node.name, len(node.get_children()) if n_children is None else n_children,
+            sum(per_species.values()), len(per_species), max(per_species.values()), n_species_sets, event,
+            n_pairs)
 
 
 class MergedGenes(list):
@@ -781,6 +861,7 @@ def write_polytomies(records, d_out):
     earlier run of the same results directory, as a restart from the trees).
     """
     fn = os.path.join(d_out, POLYTOMIES_FN)
+    run_report.count("olog.polytomies_resolved", sum(1 for r in records if r[7] == RESOLVED), len(records))
     if not records:
         if os.path.exists(fn):
             os.remove(fn)
@@ -805,11 +886,12 @@ def polytomies_summary(records, fn):
     for r in records:
         events[r[7]] += 1
     largest = max(records, key=lambda r: (r[2], r[3]))
-    return ("%d %s in %d %s (%d speciation, %d duplication, %d single species); largest %s node %s, "
+    resolved = (", %d resolved with the species tree" % events[RESOLVED]) if events[RESOLVED] else ""
+    return ("%d %s in %d %s (%d speciation, %d duplication, %d single species%s); largest %s node %s, "
             "%d children, %d genes, %d species; details in %s"
             % (len(records), "polytomy" if len(records) == 1 else "polytomies",
                n_ogs, "orthogroup" if n_ogs == 1 else "orthogroups",
-               events["speciation"], events["duplication"], events["single species"],
+               events["speciation"], events["duplication"], events["single species"], resolved,
                largest[0], largest[1], largest[2], largest[3], largest[4], fn))
 
 
@@ -1109,11 +1191,16 @@ def get_lines_for_ortholog_files(
     return n_ortho
 
 
+class HogAnalysisError(Exception):
+    """The HOGs of a gene tree could not be inferred (get_hogs_from_tree)."""
+
+
 def get_hogs_from_tree(
         iog,
         tree,
         hog_writer,
         q_split_paralogous_clades,
+        q_report=False,
     ):
     """
     Generate HOG rows from one gene tree.
@@ -1127,7 +1214,8 @@ def get_hogs_from_tree(
         print("\n===== %s =====" % og_name)
 
     try:
-        tree = hog_writer.mark_dups_below(tree)
+        # (q_report: the duplications of no single level in the run report, from the pass of the results' HOGs)
+        tree = hog_writer.mark_dups_below(tree, og_name if q_report else None)
         cached_hogs = []
 
         for n in tree.traverse("preorder"):
@@ -1141,11 +1229,6 @@ def get_hogs_from_tree(
 
         return cached_hogs
 
-    except Exception:
-        print("WARNING: HOG analysis for %s failed" % og_name)
-        print(
-            "Please report to https://github.com/davidemms/OrthoFinder/issues "
-            "including SpeciesTree_rooted_ids.txt and Trees_ids/%s_tree_id.txt "
-            "from WorkingDirectory/" % og_name
-        )
-        raise
+    except Exception as e:
+        # (the run report's "HOGs" check, not an error of the tree's orthologs)
+        raise HogAnalysisError("%s: %s" % (type(e).__name__, e)) from e

@@ -16,7 +16,9 @@ Expanded_Orthologs/Putative_Xenologs of the results directory (or of the
 directory given with -o). The other rows are copied as they are, and the run's
 own files are not changed. It reads the polytomies from
 Resolved_Gene_Trees/Polytomies.tsv and their children from
-Resolved_Gene_Trees/Resolved_Gene_Trees.txt. The rows can be many: about 2.7
+Resolved_Gene_Trees/Resolved_Gene_Trees.txt. A polytomy that the run
+resolved (with a child of several species) has rows of binary nodes, as any
+other node, so they are copied as they are. The rows can be many: about 2.7
 billion and 160 GB for a node of 50,000 children, with as much again of
 temporary files next to the output while they are written.
 

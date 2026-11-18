@@ -60,6 +60,7 @@ import copy  # Y
 import time  # Y
 import os.path  # Y
 from ..utils import parallel_task_manager, file_handler, util, fasta_processor, file_io, run_state, orthoxml
+from ..utils import run_report
 from ..mcl_orthogroups import infer_orthogroups, orthogroups_set
 from ..mcl_orthogroups import assign as assign
 from orthofinder.utils import logging as run_logging
@@ -132,6 +133,7 @@ def main(args=None):
         previous_sigterm = None
     file_handler.handler.reset()
     file_io.clear_caches()   # main() may run more than once in a process (e.g. tests)
+    run_report.start()
     t_start = time.perf_counter()
     ctx = RunContext()  # ctx.current_step: "Initialisation"
     exit_code = 0
@@ -215,6 +217,7 @@ def main(args=None):
     finally:
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
+        finish.write_run_report()
         run_logging.RunLogger.set_logger(None)
         if ctx.log is not None:
             ctx.log.close()

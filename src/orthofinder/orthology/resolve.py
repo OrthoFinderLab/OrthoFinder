@@ -8,7 +8,9 @@ Created on Thu Jul 27 14:15:17 2017
 import os
 import glob
 import numpy as np
+import heapq
 import itertools
+from collections import defaultdict
 import argparse
 try:
     from rich import print
@@ -490,6 +492,161 @@ def resolve(n, M):
 #         parser.add_argument("--no_resolve", action="store_true", help="Only perform species-overlap duplication analysis")
 #         args = parser.parse_args()
 #         Resolve_Main(args.gene_tree, args.out_dir, args.rooted_species_tree, om1.GetGeneToSpeciesMap(args), args.nthreads, not args.no_resolve, False)
+
+
+# A polytomy is resolved (resolve_polytomies) only if one of its children has
+# genes of several species. A polytomy of children of one species each (as
+# FastTree's of identical sequences) is left as it is: its orthologs are the
+# same either way, and its grouped rows are kept (tree_analyser).
+RESOLVED = "resolved"
+_clades = [None, None]        # (species tree, {node: its species}) of the last species tree
+
+
+def resolve_polytomies(tree, GeneToSpecies, species_tree):
+    """
+    Resolve, in place, each polytomy of tree with a child of several species:
+    its children as few groups whose children share no species as are found
+    (disjoint_groups: a group's genes are then all orthologs), in a group joined as the species
+    tree, and the groups joined by duplications. The children of the same
+    single species are first put together, as they are in a polytomy of them
+    alone. Without this, the polytomy's orthologs (every pair of children of
+    no shared species) could be those of no tree. The new nodes have no
+    length.
+
+    Returns a record of each polytomy resolved, (node, genes, children,
+    species sets of children), for Polytomies.tsv (tree_analyser). The node
+    is the polytomy's, the top of its new nodes.
+    """
+    resolved = []
+    for n in list(tree.traverse("postorder")):
+        ch = n.get_children()
+        if len(ch) <= 2:
+            continue
+        sets = [frozenset(s for s in map(GeneToSpecies, c.get_leaf_names()) if s is not None) for c in ch]
+        if all(len(s) <= 1 for s in sets):
+            continue
+        resolved.append((n, n.get_leaf_names(), len(ch), len(set(sets))))
+        resolve_polytomy(n, ch, sets, species_tree)
+    return resolved
+
+
+def resolve_polytomy(n, ch, sets, species_tree):
+    """n's children ch (their species, sets) as a binary tree below n (see resolve_polytomies)."""
+    units, unit_sets, by_species = [], [], {}
+    for c, s in zip(ch, sets):
+        c.detach()
+        if len(s) == 1:
+            sp = next(iter(s))
+            if sp in by_species:
+                by_species[sp].append(c)
+                continue
+            by_species[sp] = [c]
+            units.append(by_species[sp])
+        else:
+            units.append(c)
+        unit_sets.append(s)
+    # (the children of a species together: a node of them, a polytomy if more than two)
+    units = [(u[0] if len(u) == 1 else _new_node(u)) if isinstance(u, list) else u for u in units]
+    bits = {sp: 1 << i for i, sp in enumerate(sorted(frozenset().union(*unit_sets), key=str))}
+    masks = [sum(bits[sp] for sp in s) for s in unit_sets]
+    groups = disjoint_groups(masks)
+    clades = species_clades(species_tree)
+    top = None
+    for g in groups:
+        sub = _species_tree_order(species_tree, [(units[i], unit_sets[i]) for i in g], clades)
+        top = sub if top is None else _new_node([top, sub])
+    for c in top.get_children():
+        n.add_child(c.detach())
+
+
+def disjoint_groups(masks):
+    """
+    The indices of masks (species bitmasks) as few groups of no shared species
+    (DSatur colouring, the most constrained first: the fewest in nearly every
+    case, not always), each sorted, by their first index. Every two groups
+    share a species (a group is new only if its first one shares a species
+    with every group before it).
+    """
+    n = len(masks)
+    by_bit = defaultdict(list)
+    for i, m in enumerate(masks):
+        while m:
+            b = m & -m
+            by_bit[b].append(i)
+            m ^= b
+    # (the children that share a species with i, at most once each: the sum
+    # over its species, an upper bound, as a tie-break)
+    degree = []
+    for m in masks:
+        d = 0
+        while m:
+            b = m & -m
+            d += len(by_bit[b]) - 1
+            m ^= b
+        degree.append(d)
+    saturation = [set() for _ in range(n)]
+    heap = [(0, -degree[i], i) for i in range(n)]
+    heapq.heapify(heap)
+    done = [False] * n
+    unions, members = [], []
+    while heap:
+        neg_sat, _, i = heapq.heappop(heap)
+        if done[i] or -neg_sat != len(saturation[i]):
+            continue            # (an entry since replaced)
+        done[i] = True
+        g = next((k for k, u in enumerate(unions) if not u & masks[i]), None)
+        if g is None:
+            unions.append(0)
+            members.append([])
+            g = len(unions) - 1
+        unions[g] |= masks[i]
+        members[g].append(i)
+        m = masks[i]
+        while m:
+            b = m & -m
+            m ^= b
+            for j in by_bit[b]:
+                if not done[j] and g not in saturation[j]:
+                    saturation[j].add(g)
+                    heapq.heappush(heap, (-len(saturation[j]), -degree[j], j))
+    return sorted(sorted(m) for m in members)
+
+
+def species_clades(species_tree):
+    """{node: frozenset of its species} of the species tree (kept for the next tree)."""
+    if _clades[0] is not species_tree:
+        clades = {}
+        for node in species_tree.traverse("postorder"):
+            clades[node] = (frozenset([node.name]) if node.is_leaf() else
+                            frozenset().union(*(clades[c] for c in node.get_children())))
+        _clades[:] = [species_tree, clades]
+    return _clades[1]
+
+
+def _species_tree_order(st_node, items, clades):
+    """items ((node, species), of no shared species) joined as the species tree below st_node."""
+    if len(items) == 1:
+        return items[0][0]
+    parts = []
+    spanning = list(items)
+    for c in st_node.get_children():
+        below = [it for it in spanning if it[1] and it[1] <= clades[c]]
+        if below:
+            parts.append(_species_tree_order(c, below, clades))
+            spanning = [it for it in spanning if not (it[1] and it[1] <= clades[c])]
+    parts.extend(node for node, _ in spanning)
+    top = parts[0]
+    for p in parts[1:]:
+        top = _new_node([top, p])
+    return top
+
+
+def _new_node(children):
+    node = tree_lib.TreeNode()
+    node.dist = 0.
+    for c in children:
+        node.add_child(c)
+    return node
 
 
 def resolve_tree(tree, GeneToSpecies):

@@ -176,8 +176,9 @@ def misplaced(monkeypatch, *genes):
 
 SUSPECT_TREES = [
     # a polytomy with a misplaced gene (suspect), below an overlap it resolves
-    "((%s,0_900,(1_901,2_902)),(0_903,3_904));" % star(60, 1)[1:-2],
-    "((%s,0_900,(1_901,0_902)),(0_903,1_904,4_905));" % star(60, 2)[1:-2],
+    # (polytomies of children of one species each: not resolved)
+    "((%s,0_900),(0_903,3_904));" % star(60, 1)[1:-2],
+    "((%s,0_900,0_902),(0_903,1_904,4_905));" % star(60, 2)[1:-2],
 ]
 
 
@@ -191,13 +192,119 @@ def test_polytomy_with_suspect_genes(monkeypatch, newick):
 
 @pytest.mark.parametrize("seed", range(5))
 def test_polytomy_children_of_several_species(seed):
+    # resolved: no polytomy left with a child of several species, and orthologs of a tree
     rng = random.Random(seed)
     children = []
-    for i in range(50):
+    for i in range(12):
         sps = rng.sample(range(N_SPECIES), rng.choice([1, 1, 2, 3]))
         genes = ["%d_%d" % (sp, 10 * i + j) for j, sp in enumerate(sps)]
         children.append(genes[0] if len(genes) == 1 else "(%s)" % ",".join(genes))
-    assert_as_before("(%s);" % ",".join(children))
+    if all("(" not in c for c in children):
+        children[0] = "(0_998,1_999)"
+    newick = "(%s);" % ",".join(children)
+    polytomies = []
+    orthologs, recon, suspect, _ = analyse(newick, polytomies)
+    assert [r[7] for r in polytomies if r[1] == "n0"] == ["resolved"]
+    for n in recon.traverse():
+        if len(n.get_children()) > 2:
+            assert all(len({g.split("_")[0] for g in c.get_leaf_names()}) == 1 for c in n.get_children())
+    assert_as_before(newick)
+    assert_tree_like(ortholog_pairs(orthologs))
+
+
+def ortholog_pairs(orthologs):
+    """The ortholog gene pairs (unordered) of the entries."""
+    pairs = set()
+    for o in per_pair(orthologs):
+        left = [(sp, g) for sp, genes in list(o[0].items()) + list(o[2].items()) for g in genes]
+        right = [(sp, g) for sp, genes in list(o[1].items()) + list(o[3].items()) for g in genes]
+        pairs.update(frozenset([a, b]) for a in left for b in right)
+    return pairs
+
+
+def assert_tree_like(pairs):
+    """No 4 genes a-b-c-d orthologs in a path and no other pair (P4): such orthologs are of no tree."""
+    genes = sorted({g for p in pairs for g in p})
+    for a, b, c, d in itertools.permutations(genes, 4):
+        if a < d and all(frozenset(p) in pairs for p in ((a, b), (b, c), (c, d))) and \
+                not any(frozenset(p) in pairs for p in ((a, c), (b, d), (a, d))):
+            raise AssertionError("orthologs of no tree: %s-%s-%s-%s" % (a, b, c, d))
+
+
+def test_polytomy_of_mixed_children_resolved():
+    # as before: A1-B1, A2-B1 and A2-B2 orthologs, but not A1-B2 (orthologs of no tree)
+    newick = "((0_1,2_1),1_1,0_2,(1_2,2_2));"
+    polytomies = []
+    orthologs, recon, _, dups = analyse(newick, polytomies)
+    pairs = {tuple(sorted("%s_%s" % g for g in p)) for p in ortholog_pairs(orthologs)}
+    assert pairs == {("0_1", "1_1"), ("0_1", "2_1"), ("1_1", "2_1"), ("0_2", "1_2"), ("0_2", "2_2"),
+                     ("1_2", "2_2")}
+    assert all(len(n.get_children()) == 2 for n in recon.traverse() if not n.is_leaf())
+    assert len(dups) == 1
+    assert polytomies == [("OG0000007", "n0", 4, 6, 3, 2, 4, "resolved", 0)]
+
+
+def test_resolved_as_the_species_tree():
+    # ((0,1),((2,3),(4,5))): the genes of 0 and 1 together, then 2-3 and 4
+    orthologs, recon, _, _ = analyse("((0_1,1_1),0_2,0_3,1_2,(2_1,3_1),4_1);")
+    a, b = recon.get_children()
+    sides = sorted(sorted(c.get_leaf_names()) for c in (a, b))
+    assert sides == [["0_1", "0_2", "0_3", "1_1", "1_2"], ["2_1", "3_1", "4_1"]]
+
+
+def test_resolved_recorded_from_the_first_pass():
+    # the first pass resolves the polytomy and writes its tree, which the second
+    # reads (with none to resolve): the second records it, by its genes
+    newick = "(((0_1,2_1),1_1,0_2,(1_2,2_2)),(3_1,3_2));"
+    sp_tree = species_tree()
+    resolved = []
+    _, t1, _, _ = tree_analyser.get_orthologs_from_tree(
+        7, gene_tree(newick), sp_tree, tree_analyser.gene_to_species_dash, get_species_neighbours(sp_tree),
+        q_get_dups=True, q_orthologs=False, resolved=resolved)
+    assert [r[1:] for r in resolved] == [(4, 4)] and sorted(resolved[0][0]) == ["0_1", "0_2", "1_1", "1_2",
+                                                                               "2_1", "2_2"]
+    assert all(len(n.get_children()) <= 2 for n in t1.traverse())
+    ta = tree_analyser.TreeAnalyser.__new__(tree_analyser.TreeAnalyser)
+    ta.set_hog_pass_resolved(resolved)
+    polytomies = []
+    tree_analyser.get_orthologs_from_tree(
+        9, gene_tree(t1.write(format=5)), sp_tree, tree_analyser.gene_to_species_dash,
+        get_species_neighbours(sp_tree), q_get_dups=True, polytomies=polytomies,
+        hog_pass_resolved=ta.hog_pass_resolved)
+    (r,) = polytomies
+    assert r[0] == "OG0000009" and r[2:] == (4, 6, 3, 2, 4, "resolved", 0)
+    assert r[1] != "n0"         # (the node of its genes, below the root)
+
+
+def test_no_polytomies_resolved_without_reconciliation():
+    # (only_overlap: no species tree reconciliation) left as it is, its rows grouped
+    sp_tree = species_tree()
+    polytomies = []
+    _, t, _, _ = tree_analyser.get_orthologs_from_tree(
+        7, gene_tree("((0_1,2_1),1_1,0_2,(1_2,2_2));"), sp_tree, tree_analyser.gene_to_species_dash,
+        get_species_neighbours(sp_tree), q_get_dups=True, q_no_recon=True, polytomies=polytomies)
+    assert len(t.get_children()) == 4 and [r[7] for r in polytomies] == ["speciation"]
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_disjoint_groups_fewest(seed):
+    # (a heuristic, the fewest on these small cases)
+    from orthofinder.orthology import resolve
+    rng = random.Random(seed)
+    masks = [rng.randrange(1, 64) for _ in range(rng.randrange(2, 8))]
+    groups = resolve.disjoint_groups(masks)
+    assert sorted(i for g in groups for i in g) == list(range(len(masks)))
+    unions = []
+    for g in groups:
+        assert all(not masks[i] & masks[j] for i, j in itertools.combinations(g, 2))
+        unions.append(sum(masks[i] for i in g))
+    assert all(u & v for u, v in itertools.combinations(unions, 2))
+    # (the fewest, by trying every assignment)
+    fewest = min(k for k in range(1, len(masks) + 1)
+                 if any(all(not masks[i] & masks[j] for i, j in itertools.combinations(range(len(masks)), 2)
+                            if c[i] == c[j])
+                        for c in itertools.product(range(k), repeat=len(masks))))
+    assert len(groups) == fewest
 
 
 def test_polytomy_children_of_two_species():
@@ -240,7 +347,7 @@ def test_polytomy_of_different_species_sets_rows_unchanged():
 
 @pytest.mark.parametrize("newick, dup, event", [
     ("(0_1,0_2,0_3,0_4);", True, "single species"),
-    ("((0_1,1_1),(0_2,1_2),(0_3,1_3));", True, "duplication"),   # every pair of children shares a species
+    ("(0_1,0_2,(0_3,0_4));", True, "single species"),
     ("(0_1,1_2,2_3,0_4);", False, "speciation"),
 ])
 def test_polytomy_duplications(newick, dup, event):
@@ -258,9 +365,9 @@ def test_polytomy_records_of_a_tree():
     analyse(newick, polytomies)
     assert [r[2] for r in polytomies] == [3, 3, 3]
     events = sorted(r[7] for r in polytomies)
-    assert events == ["single species", "speciation", "speciation"]
-    root = next(r for r in polytomies if r[3] == 10)
-    assert root[4:7] == (6, 3, 3)
+    assert events == ["resolved", "single species", "speciation"]
+    root = next(r for r in polytomies if r[3] == 10)       # (children of several species: resolved)
+    assert root[1] == "n0" and root[4:9] == (6, 3, 3, "resolved", 0)
     inner = next(r for r in polytomies if r[3] == 5)
     assert inner[4:9] == (2, 3, 2, "speciation", 6)
     single = next(r for r in polytomies if r[7] == "single species")
@@ -291,6 +398,7 @@ def test_write_polytomies(tmp_path, capsys):
     (line,) = checkpoint.read_text().splitlines()
     assert "WARNING" not in line and tree_analyser.POLYTOMY_STAGE in line
     assert "4 polytomies in 2 orthogroups (2 speciation, 1 duplication, 1 single species)" in line
+    assert "resolved" not in line
     assert "largest OG0000002 node n0, 51648 children, 51648 genes, 1222 species" in line
     assert capsys.readouterr().out == ""               # (nothing on screen)
     assert not (tmp_path / "none").exists()
